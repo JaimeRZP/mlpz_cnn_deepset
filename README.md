@@ -84,6 +84,10 @@ X_test, _ = znn.catalog_to_XY(test, **features)
    - Each member can be given its own inputs: `resampled_inputs` draws one noise realization of the
      training photometry per member from its errors (just the photometry as given if it has none), so
      the members differ by noise realization rather than by data cut.
+   - `train_noise_ensemble` is a cheaper way to get the same kind of ensemble: one base model is trained
+     on the catalogue photometry, then each member is a copy of it fine-tuned on its own noise realization
+     at a smaller learning rate (`FINETUNE_LR`, default 1e-4) for at most `FINETUNE_EPOCHS` (default 10);
+     `N_REALIZATIONS` (default 10) members.
    - Each member predicts a single redshift, trained with an MSE loss. Targets are scaled as z / 3.
    - Training uses early stopping and reduces the learning rate when the validation loss plateaus.
    - **Pre-training (default):** every member starts from a copy of the same pre-trained member

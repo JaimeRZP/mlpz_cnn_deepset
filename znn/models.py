@@ -21,6 +21,7 @@ __all__ = [
     "save_ensemble_file",
     "load_ensemble_file",
     "train_ensembles",
+    "train_noise_ensemble",
     "save_pretrained",
     "load_pretrained",
     "DEFAULT_PRETRAINING",
@@ -363,6 +364,7 @@ def train_ensembles(
     pretraining=DEFAULT_PRETRAINING,
     VAL_FRAC=0.2,
     pretrained_member=0,
+    LEARNING_RATE=1e-3,
 ):
     """
     Train an ensemble of N_SPLITS models, each predicting a point redshift trained with MSE.
@@ -375,6 +377,8 @@ def train_ensembles(
     X is either one feature array shared by all members, or a list of N_SPLITS arrays (same objects, in
     the same order as Y), one per member, e.g. a different photometric noise realization for each.
 
+    LEARNING_RATE: initial Adam learning rate (1e-3 is the Adam default), reduced on validation plateaus.
+
     pretraining: where each member starts.
       - "popcosmos" (default): the ensemble shipped with znn, trained on the pop-cosmos mock (see
         load_pretrained). Its inputs were built with the default feature config, so X must be too (in
@@ -386,7 +390,7 @@ def train_ensembles(
       With pre-training, every member starts from a copy of pre-trained member pretrained_member (or, with
       pretrained_member=None, member k from pre-trained member k mod K, for K pre-trained members), with its
       first N_FROZEN_LAYERS layers frozen and its Y normalisation kept;
-      everything else (optimizer, learning rate, epochs, callbacks, split) is the same as from scratch, and
+      everything else (optimizer, learning rate, epochs, callbacks, split) is as from scratch, and
       build_model_func is not used. The pre-trained models are not modified.
     """
     pretrained = _resolve_pretraining(pretraining)
@@ -441,7 +445,7 @@ def train_ensembles(
         Y_train_norm = (Y_train - Y_mean) / Y_std
         Y_val_norm = (Y_val - Y_mean) / Y_std
 
-        model.compile(optimizer="adam", loss="mse")
+        model.compile(optimizer=tf.keras.optimizers.Adam(LEARNING_RATE), loss="mse")
 
         # Train
         history = model.fit(
@@ -458,3 +462,91 @@ def train_ensembles(
         histories.append(history)
 
     return trained_models, histories
+
+
+def train_noise_ensemble(
+    build_model_func,
+    df,
+    Y,
+    errors,
+    rng,
+    bands,
+    ref_band,
+    config=DEFAULT_FEATURE_CONFIG,
+    filter_curves=None,
+    N_REALIZATIONS=10,
+    EPOCHS=100,
+    FINETUNE_EPOCHS=10,
+    FINETUNE_LR=1e-4,
+    BATCH_SIZE=256,
+    random_state=42,
+    pretraining=DEFAULT_PRETRAINING,
+    VAL_FRAC=0.2,
+    pretrained_member=0,
+):
+    """
+    Train an ensemble over noise realizations of the training photometry in two stages, cheaper than
+    training every member in full (train_ensembles on resampled_inputs):
+
+      1. a base model is trained on the catalogue photometry as given, from `pretraining` as in
+         train_ensembles (up to EPOCHS epochs);
+      2. each of the N_REALIZATIONS members is a copy of the base model fine-tuned on its own noise realization
+         (see resample_photometry), at the smaller learning rate FINETUNE_LR for up to FINETUNE_EPOCHS
+         epochs, with the base model's first N_FROZEN_LAYERS layers frozen and its Y normalisation.
+
+    The realizations are small deviations around the catalogue photometry, so the fine-tuning starts close
+    to its optimum. All stages use the same data cut (random_state, VAL_FRAC). Each realization is drawn
+    just before its member is trained, so N_REALIZATIONS can be large without holding them all in memory.
+    If df has no errors (see has_errors) there is nothing to sample over and the ensemble is the base
+    model alone.
+
+    df: the training catalogue (see znn.io.read_catalog), with Y its redshifts in the same order.
+    errors, rng: as for resample_photometry.
+    bands, ref_band, config, filter_curves: as for catalog_to_XY.
+    The other arguments are as for train_ensembles.
+
+    Returns (trained_models, histories, base_history): the members as (model, Y_mean, Y_std), the Keras
+    history of each member's fine-tuning, and that of the base model.
+    """
+    if filter_curves is None:
+        filter_curves = load_filter_curves(bands)
+
+    def inputs(photometry):
+        return catalog_to_XY(photometry, bands, ref_band, config, filter_curves=filter_curves)[0]
+
+    print("\n=== Base model, on the catalogue photometry ===")
+    base, base_histories = train_ensembles(
+        build_model_func,
+        inputs(df),
+        Y,
+        N_SPLITS=1,
+        EPOCHS=EPOCHS,
+        BATCH_SIZE=BATCH_SIZE,
+        random_state=random_state,
+        pretraining=pretraining,
+        VAL_FRAC=VAL_FRAC,
+        pretrained_member=pretrained_member,
+    )
+    if not has_errors(df, errors):
+        return base, [], base_histories[0]
+
+    trained_models = []
+    histories = []
+    for member in range(N_REALIZATIONS):
+        print(f"\n=== Fine-tuning on noise realization {member+1}/{N_REALIZATIONS} ===")
+        trained, history = train_ensembles(
+            build_model_func,
+            inputs(resample_photometry(df, errors, rng)),
+            Y,
+            N_SPLITS=1,
+            EPOCHS=FINETUNE_EPOCHS,
+            BATCH_SIZE=BATCH_SIZE,
+            random_state=random_state,
+            pretraining=base,
+            VAL_FRAC=VAL_FRAC,
+            LEARNING_RATE=FINETUNE_LR,
+        )
+        trained_models += trained
+        histories += history
+
+    return trained_models, histories, base_histories[0]
