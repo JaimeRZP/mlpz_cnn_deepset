@@ -402,11 +402,12 @@ def _kfold_cuts(n_objects, n_members, random_state):
     return list(KFold(n_splits=n_members, shuffle=True, random_state=random_state).split(np.arange(n_objects)))
 
 
-def _train_member(build_model_func, X, Y, idx_train, idx_val, start, EPOCHS, BATCH_SIZE, LEARNING_RATE):
+def _train_member(build_model_func, X, Y, idx_train, idx_val, start, EPOCHS, BATCH_SIZE, LEARNING_RATE, monitor=True):
     """
     Train one member on X[idx_train], with X[idx_val] for early stopping and learning-rate reduction: from
     scratch with build_model_func (start None), or from a copy of start = (model, Y_mean, Y_std) with its first
-    N_FROZEN_LAYERS layers frozen and its Y normalisation kept. Returns ((model, Y_mean, Y_std), history).
+    N_FROZEN_LAYERS layers frozen and its Y normalisation kept. With monitor False, X[idx_val] only goes in the
+    history: the member trains for all EPOCHS at a constant LEARNING_RATE. Returns ((model, Y_mean, Y_std), history).
     """
     # Clear session before each member
     tf.keras.backend.clear_session()
@@ -445,7 +446,7 @@ def _train_member(build_model_func, X, Y, idx_train, idx_val, start, EPOCHS, BAT
         validation_data=(X_val, Y_val_norm),
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
-        callbacks=[early_stop, reduce_lr],
+        callbacks=[early_stop, reduce_lr] if monitor else [],
         verbose=2,
     )
     return (model, Y_mean, Y_std), history  # model + its normalisation
@@ -545,10 +546,11 @@ def train_from_catalog(
       1. a base model, from `pretraining`, on all the objects and the photometry as given (a random VAL_FRAC
          of them is held out for its early stopping), up to EPOCHS epochs;
       2. every member is a copy of the base model fine-tuned on its own noise realization and data cut, at
-         the smaller learning rate FINETUNE_LR for up to FINETUNE_EPOCHS epochs, with the base model's first
-         N_FROZEN_LAYERS layers frozen and its Y normalisation.
-      The base model has seen every member's validation objects, so the members' early stopping is not on
-      unseen data. Without from_base every member is trained in full from `pretraining` (up to EPOCHS, at the
+         the learning rate FINETUNE_LR for FINETUNE_EPOCHS epochs, with the base model's first N_FROZEN_LAYERS
+         layers frozen and its Y normalisation.
+      The base model has seen every member's validation objects, so their validation loss cannot tell a better
+      member from one that stays close to the base: the fine-tuning has no early stopping or learning-rate
+      reduction, and runs all FINETUNE_EPOCHS at a constant FINETUNE_LR. Without from_base every member is trained in full from `pretraining` (up to EPOCHS, at the
       Adam default learning rate).
 
     df: the training catalogue (see znn.io.read_catalog), with Y its reference redshifts in the same order.
@@ -573,19 +575,19 @@ def train_from_catalog(
     _check_inputs(start, X_given.shape[1:])
 
     base_history = None
-    epochs, learning_rate = EPOCHS, 1e-3
+    epochs, learning_rate, monitor = EPOCHS, 1e-3, True
     if from_base:
         print("\n=== Base model, on all objects with the photometry as given ===")
         idx_train, idx_val = train_test_split(np.arange(len(Y)), test_size=VAL_FRAC, random_state=random_state)
         start, base_history = _train_member(build_model_func, X_given, Y, idx_train, idx_val, start, EPOCHS, BATCH_SIZE, 1e-3)
-        epochs, learning_rate = FINETUNE_EPOCHS, FINETUNE_LR
+        epochs, learning_rate, monitor = FINETUNE_EPOCHS, FINETUNE_LR, False
 
     trained_models = []
     histories = []
     for member, (idx_train, idx_val) in enumerate(_kfold_cuts(len(Y), N_MEMBERS, random_state)):
         print(f"\n--- Member {member+1}/{N_MEMBERS}" + (" (its own noise realization)" if noisy else "") + " ---")
         X = inputs(resample_photometry(df, errors, rng)) if noisy else X_given
-        trained, history = _train_member(build_model_func, X, Y, idx_train, idx_val, start, epochs, BATCH_SIZE, learning_rate)
+        trained, history = _train_member(build_model_func, X, Y, idx_train, idx_val, start, epochs, BATCH_SIZE, learning_rate, monitor)
         trained_models.append(trained)
         histories.append(history)
 

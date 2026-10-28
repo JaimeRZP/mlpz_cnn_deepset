@@ -92,11 +92,12 @@ X_test, _ = znn.catalog_to_XY(test, **features)
    - `from_base=True` is cheaper per member: one base model is trained on all the objects with the
      photometry as given (with `VAL_FRAC` of them held out for its early stopping), then every member is a
      copy of it fine-tuned on its own realization and fold at
-     `FINETUNE_LR` (default 1e-4) for at most `FINETUNE_EPOCHS` (default 10).
+     `FINETUNE_LR` (default 1e-4) for `FINETUNE_EPOCHS` (default 10). The base model has seen every
+     member's validation fold, so the fine-tuning has no early stopping or learning-rate reduction.
    - `train_ensembles` is the matrix-level building block: the same training from inputs you build
      yourself (one array for all members, or one per member), with the same K-fold cuts.
    - Each member predicts a single redshift, trained with an MSE loss. Targets are scaled as z / 3.
-   - Training uses early stopping and reduces the learning rate when the validation loss plateaus.
+   - Full training uses early stopping and reduces the learning rate when the validation loss plateaus.
    - **Pre-training (default):** every member starts from a copy of one pre-trained model, with its
      first two convolutional blocks frozen, and trains with the same settings as from scratch.
      - `pretraining="popcosmos"` (default): a model shipped with znn
