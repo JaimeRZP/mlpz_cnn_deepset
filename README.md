@@ -92,7 +92,7 @@ X_test, _ = znn.catalog_to_XY(test, **features)
    - `from_base=True` is cheaper per member: one base model is trained on all the objects with the
      photometry as given (with `VAL_FRAC` of them held out for its early stopping), then every member is a
      copy of it fine-tuned on its own realization and fold at
-     `FINETUNE_LR` (default 1e-4) for `FINETUNE_EPOCHS` (default 10). The base model has seen every
+     `FINETUNE_LR` (default 3e-4) for `FINETUNE_EPOCHS` (default 10). The base model has seen every
      member's validation fold, so the fine-tuning has no early stopping or learning-rate reduction.
    - `train_ensembles` is the matrix-level building block: the same training from inputs you build
      yourself (one array for all members, or one per member), with the same K-fold cuts.

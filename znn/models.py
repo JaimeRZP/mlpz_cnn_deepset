@@ -524,7 +524,7 @@ def train_from_catalog(
     from_base=False,
     EPOCHS=100,
     FINETUNE_EPOCHS=10,
-    FINETUNE_LR=1e-4,
+    FINETUNE_LR=3e-4,
     BATCH_SIZE=256,
     random_state=42,
     pretraining=DEFAULT_PRETRAINING,
