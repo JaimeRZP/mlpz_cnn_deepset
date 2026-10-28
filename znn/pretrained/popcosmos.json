@@ -4,22 +4,6 @@
     {
       "Y_mean": 0.0,
       "Y_std": 3.0
-    },
-    {
-      "Y_mean": 0.0,
-      "Y_std": 3.0
-    },
-    {
-      "Y_mean": 0.0,
-      "Y_std": 3.0
-    },
-    {
-      "Y_mean": 0.0,
-      "Y_std": 3.0
-    },
-    {
-      "Y_mean": 0.0,
-      "Y_std": 3.0
     }
   ],
   "config": {
@@ -35,7 +19,7 @@
     "k": 20
   },
   "info": {
-    "description": "5-member znn ensemble trained on the pop-cosmos mock; the default starting point for train_ensembles",
+    "description": "znn model trained on the pop-cosmos mock: the single default starting point for train_ensembles (member 0 of the 5-member ensemble trained in the notebook below)",
     "training_data": {
       "catalogue": "pop-cosmos mock_catalog_Ch1_26.h5, v1.1.0 (Zenodo 10.5281/zenodo.17132433)",
       "catalogue_md5": "f25a03ade85220ecde38cc9cdbb52e1f",
@@ -82,6 +66,7 @@
       "tensorflow": "2.21.0",
       "keras": "3.15.1",
       "source_pkl_md5": "8da1374bc0987d5065bdcc63d0b869ef"
-    }
+    },
+    "reduced": "kept member 0 of the 5 trained members only (2026-10-28): train_ensembles starts every member from one model"
   }
 }

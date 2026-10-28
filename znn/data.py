@@ -16,7 +16,6 @@ __all__ = [
     "catalog_to_XY",
     "has_errors",
     "resample_photometry",
-    "resampled_inputs",
 ]
 
 # Processing settings for catalog_to_XY; the bands themselves are always supplied by the user.
@@ -311,24 +310,3 @@ def resample_photometry(df, errors, rng):
         out[mag_column] = mag_new
     return out
 
-
-def resampled_inputs(df, errors, n_realizations, rng, bands, ref_band, config=DEFAULT_FEATURE_CONFIG, filter_curves=None):
-    """
-    CNN inputs for n_realizations independent noise realizations of a catalogue's photometry (see
-    resample_photometry), e.g. one per ensemble member for train_ensembles.
-
-    errors, rng: as for resample_photometry.
-    bands, ref_band, config, filter_curves: as for catalog_to_XY.
-
-    Returns a list of n_realizations arrays X, each of shape (n_sources, n_bins, 3), with the sources in the
-    order of df. If df has no errors (see has_errors) there is only one realization, the photometry as given,
-    and every entry of the list is that same array.
-    """
-    if filter_curves is None:
-        filter_curves = load_filter_curves(bands)
-    if not has_errors(df, errors):
-        return [catalog_to_XY(df, bands, ref_band, config, filter_curves=filter_curves)[0]] * n_realizations
-    return [
-        catalog_to_XY(resample_photometry(df, errors, rng), bands, ref_band, config, filter_curves=filter_curves)[0]
-        for _ in range(n_realizations)
-    ]
