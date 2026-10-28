@@ -4,12 +4,12 @@ import pickle
 
 import numpy as np
 import tensorflow as tf
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold, train_test_split
 from tensorflow.keras import callbacks, layers, models
 
 from .data import DEFAULT_FEATURE_CONFIG, catalog_to_XY, has_errors, resample_photometry
 from .io import load_filter_curves
-from .qp_output import DEFAULT_Z_BINS, package_samples
+from .qp_output import package_samples
 
 __all__ = [
     "build_model",
@@ -88,10 +88,12 @@ def _inputs_per_member(X, n_members):
 
 
 # --- Prediction: pool the predictions of all models ---
-def ensemble_predict(trained_models, X_test, ids=None, bins=DEFAULT_Z_BINS):
+# TODO: unify ensemble_predict and ensemble_predict_resampled under one logic: ensemble_predict is the
+# single-realization case (no errors) of ensemble_predict_resampled, but takes prebuilt inputs instead of a catalogue.
+def ensemble_predict(trained_models, X_test, ids=None):
     """
     Predict redshifts with an ensemble of models and package the result as a
-    per-object p(z): the histogram of the members' predictions.
+    per-object p(z): a Gaussian with the mean and std of the members' predictions.
 
     Parameters
     ----------
@@ -101,13 +103,11 @@ def ensemble_predict(trained_models, X_test, ids=None, bins=DEFAULT_Z_BINS):
         Input features to predict on.
     ids : array-like, optional
         Per-object identifiers. Defaults to the sample order index (0..N-1).
-    bins : array-like
-        Histogram bin edges of the p(z).
 
     Returns
     -------
     qp.Ensemble or pandas.DataFrame
-        A qp Ensemble of per-object histograms if qp is installed, otherwise a
+        A qp Ensemble of per-object Gaussians if qp is installed, otherwise a
         DataFrame with "object_id", "mean", "std" columns. See
         :func:`znn.qp_output.package_samples`.
     """
@@ -120,7 +120,7 @@ def ensemble_predict(trained_models, X_test, ids=None, bins=DEFAULT_Z_BINS):
         predictions.append(y_pred)
 
     # one sample per member and object
-    return package_samples(np.stack(predictions, axis=1), ids=ids, bins=bins)
+    return package_samples(np.stack(predictions, axis=1), ids=ids)
 
 
 def ensemble_predict_resampled(
@@ -135,14 +135,13 @@ def ensemble_predict_resampled(
     filter_curves=None,
     ids=None,
     return_components=False,
-    bins=DEFAULT_Z_BINS,
 ):
     """
     Predict p(z) with the photometric errors propagated by Monte Carlo.
 
     Draws n_samples noise realizations of the catalogue's photometry (see resample_photometry) and runs
     every ensemble member on every realization. The n_samples x n_members predictions per object are
-    pooled, not averaged over members: the p(z) is their histogram on `bins` (see package_samples). The
+    pooled, not averaged over members: the p(z) is a Gaussian with their mean and std (see package_samples). The
     number of realizations is independent of the number of members. If df has no errors (see
     has_errors) there is only one realization, the photometry as given, whatever n_samples.
 
@@ -155,7 +154,6 @@ def ensemble_predict_resampled(
         returned by load_ensemble_file can be passed as **features.
     ids: per-object identifiers for the p(z), as for ensemble_predict.
     return_components: also return the split of the predicted std into its two sources.
-    bins: histogram bin edges of the p(z).
 
     Returns the p(z), as a qp Ensemble (or the fallback DataFrame, see package_samples). With
     return_components, returns (p(z), components), where components holds per-object stds that add in
@@ -176,7 +174,7 @@ def ensemble_predict_resampled(
         for k, (model, Y_mean, Y_std) in enumerate(trained_models):
             predictions[s, k] = model.predict(X, batch_size=4096, verbose=0).ravel() * Y_std + Y_mean
 
-    pz = package_samples(predictions.reshape(-1, len(df)).T, ids=ids, bins=bins)
+    pz = package_samples(predictions.reshape(-1, len(df)).T, ids=ids)
     if not return_components:
         return pz
 
@@ -365,14 +363,18 @@ def train_ensembles(
     VAL_FRAC=0.2,
     pretrained_member=0,
     LEARNING_RATE=1e-3,
+    data_cut="shared",
 ):
     """
     Train an ensemble of N_SPLITS models, each predicting a point redshift trained with MSE.
 
-    Every member uses the same data cut: one split of the objects (random_state), training on 1 - VAL_FRAC
-    of them and using the other VAL_FRAC for early stopping and learning-rate reduction. With
-    pre-training, every member also starts from the same pre-trained member (pretrained_member), so
-    members differ only through their inputs (and the randomness of training).
+    data_cut: how the objects are split into training and validation (early stopping and learning-rate
+    reduction) sets, both by random_state.
+      - "shared" (default): every member uses the same cut, training on 1 - VAL_FRAC of the objects. With
+        pre-training from one pre-trained member (pretrained_member), members then differ only through
+        their inputs (and the randomness of training).
+      - "kfold": a K-fold split with K = N_SPLITS; member k validates on fold k and trains on the others, so
+        members also differ by data cut. VAL_FRAC is not used.
 
     X is either one feature array shared by all members, or a list of N_SPLITS arrays (same objects, in
     the same order as Y), one per member, e.g. a different photometric noise realization for each.
@@ -405,13 +407,18 @@ def train_ensembles(
                 "them with the same feature config as the pre-training, or pass pretraining=None"
             )
 
-    # One data cut shared by all members
-    idx_train, idx_val = train_test_split(np.arange(len(Y)), test_size=VAL_FRAC, random_state=random_state)
+    # (training, validation) indices per member: one cut shared by all, or one K-fold split each
+    if data_cut == "shared":
+        cuts = [train_test_split(np.arange(len(Y)), test_size=VAL_FRAC, random_state=random_state)] * N_SPLITS
+    elif data_cut == "kfold":
+        cuts = list(KFold(n_splits=N_SPLITS, shuffle=True, random_state=random_state).split(np.arange(len(Y))))
+    else:
+        raise ValueError(f'data_cut must be "shared" or "kfold", not {data_cut!r}')
 
     trained_models = []
     histories = []
 
-    for member in range(N_SPLITS):
+    for member, (idx_train, idx_val) in enumerate(cuts):
         print(f"\n--- Member {member+1}/{N_SPLITS} ---")
         X = X_members[member]
 
@@ -422,7 +429,7 @@ def train_ensembles(
         early_stop = callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
         reduce_lr = callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1)
 
-        # Split data using the shared indices
+        # Split data using this member's cut
         X_train, X_val = X[idx_train], X[idx_val]
         Y_train, Y_val = Y[idx_train], Y[idx_val]
 

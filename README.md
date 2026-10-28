@@ -5,7 +5,7 @@ Photometric redshifts from an ensemble of 1-D convolutional neural networks.
 Each galaxy's photometry is turned into a short "spectrum" on a common wavelength grid by spreading
 every band's magnitude over its filter curve. An ensemble of CNNs predicts a redshift from it; the
 members share one training/validation split and can each be trained on their own noise realization of
-the training photometry. The per-object p(z) is the histogram of the members' predictions, optionally
+the training photometry. The per-object p(z) is a Gaussian with the mean and std of the members' predictions, optionally
 over many noise realizations of the photometry to include the photometric errors.
 
 ## Installation
@@ -105,10 +105,10 @@ X_test, _ = znn.catalog_to_XY(test, **features)
      - Pre-training checks the input shape against the pre-trained models but cannot check the grid itself.
 
 3. **p(z)** (`ensemble_predict`, `ensemble_predict_resampled`)
-   - `ensemble_predict` gives each object the histogram of the K members' predictions (bins
-     `DEFAULT_Z_BINS`, z = 0 to 3 in steps of 0.01; `zmode` is its peak).
+   - `ensemble_predict` gives each object a Gaussian with the mean and standard deviation of the K
+     members' predictions; `zmode` is the mean.
    - `ensemble_predict_resampled` also redraws the photometry S times from its errors and runs every
-     member on every draw; the p(z) is the histogram of all S × K predictions, so it includes the
+     member on every draw; the p(z) is a Gaussian with the mean and std of all S × K predictions, so it includes the
      photometric errors as well as the disagreement between members. A catalogue with no errors gets
      a single draw, the photometry as given.
    - With `return_components=True`, it also returns the two parts of the width, "model" and
@@ -121,7 +121,7 @@ X_test, _ = znn.catalog_to_XY(test, **features)
 | `znn/io.py` | Reading catalogues and filter curves | `read_catalog`, `load_filter_curves`, `catalog_to_mags` |
 | `znn/data.py` | Building CNN inputs and resampling photometry | `catalog_to_XY`, `resample_photometry`, `resampled_inputs`, `DEFAULT_FEATURE_CONFIG` |
 | `znn/models.py` | Architectures, training, prediction, saving and loading | `build_model`, `train_ensembles`, `ensemble_predict`, `ensemble_predict_resampled`, `save_ensemble_file`, `load_ensemble_file`, `save_pretrained`, `load_pretrained` |
-| `znn/qp_output.py` | Packaging predictions as p(z) | `package_samples`, `save_predictions`, `DEFAULT_Z_BINS` |
+| `znn/qp_output.py` | Packaging predictions as p(z) | `package_samples`, `save_predictions` |
 | `znn/stats.py` | Robust point-estimate statistics | `get_biweight_mean_sigma_outlier`, `get_all_stats`, `stats_to_markdown` |
 | `znn/plotting.py` | Diagnostic plots | `plot_stats`, `compare_binned_stats`, `plot_ensemble_losses`, `visualize_the_data` |
 
