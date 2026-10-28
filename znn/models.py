@@ -4,7 +4,7 @@ import pickle
 
 import numpy as np
 import tensorflow as tf
-from sklearn.model_selection import KFold
+from sklearn.model_selection import train_test_split
 from tensorflow.keras import callbacks, layers, models
 
 from .data import DEFAULT_FEATURE_CONFIG, catalog_to_XY, has_errors, resample_photometry
@@ -361,9 +361,16 @@ def train_ensembles(
     BATCH_SIZE=256,
     random_state=42,
     pretraining=DEFAULT_PRETRAINING,
+    VAL_FRAC=0.2,
+    pretrained_member=0,
 ):
     """
-    Train one model per K-fold split, each predicting a point redshift trained with MSE.
+    Train an ensemble of N_SPLITS models, each predicting a point redshift trained with MSE.
+
+    Every member uses the same data cut: one split of the objects (random_state), training on 1 - VAL_FRAC
+    of them and using the other VAL_FRAC for early stopping and learning-rate reduction. With
+    pre-training, every member also starts from the same pre-trained member (pretrained_member), so
+    members differ only through their inputs (and the randomness of training).
 
     X is either one feature array shared by all members, or a list of N_SPLITS arrays (same objects, in
     the same order as Y), one per member, e.g. a different photometric noise realization for each.
@@ -376,14 +383,17 @@ def train_ensembles(
       - your own: the name or path of a save_pretrained pair, the path of a save_ensemble_file .pkl, or a
         list of (model, Y_mean, Y_std) as returned by train_ensembles. Its inputs must be on the same grid
         as X.
-      With pre-training, member k starts from a copy of pre-trained member k mod K (K pre-trained members;
-      any N_SPLITS works), with its first N_FROZEN_LAYERS layers frozen and its Y normalisation kept;
-      everything else (optimizer, learning rate, epochs, callbacks, folds) is the same as from scratch, and
+      With pre-training, every member starts from a copy of pre-trained member pretrained_member (or, with
+      pretrained_member=None, member k from pre-trained member k mod K, for K pre-trained members), with its
+      first N_FROZEN_LAYERS layers frozen and its Y normalisation kept;
+      everything else (optimizer, learning rate, epochs, callbacks, split) is the same as from scratch, and
       build_model_func is not used. The pre-trained models are not modified.
     """
     pretrained = _resolve_pretraining(pretraining)
     X_members = _inputs_per_member(X, N_SPLITS)
     if pretrained is not None:
+        if pretrained_member is not None and not 0 <= pretrained_member < len(pretrained):
+            raise ValueError(f"pretrained_member={pretrained_member}, but there are {len(pretrained)} pre-trained members")
         expected = tuple(pretrained[0][0].input_shape[1:])
         if tuple(X_members[0].shape[1:]) != expected:
             raise ValueError(
@@ -391,35 +401,37 @@ def train_ensembles(
                 "them with the same feature config as the pre-training, or pass pretraining=None"
             )
 
-    kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=random_state)
+    # One data cut shared by all members
+    idx_train, idx_val = train_test_split(np.arange(len(Y)), test_size=VAL_FRAC, random_state=random_state)
 
     trained_models = []
     histories = []
 
-    for fold, (idx_train, idx_val) in enumerate(kf.split(np.arange(len(Y)))):
-        print(f"\n--- Fold {fold+1}/{N_SPLITS} ---")
-        X = X_members[fold]
+    for member in range(N_SPLITS):
+        print(f"\n--- Member {member+1}/{N_SPLITS} ---")
+        X = X_members[member]
 
-        # Clear session before each fold
+        # Clear session before each member
         tf.keras.backend.clear_session()
 
         # ── Callbacks ─────────────────────────────────────────────────────────────────
         early_stop = callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
         reduce_lr = callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1)
 
-        # Split data using fold indices
+        # Split data using the shared indices
         X_train, X_val = X[idx_train], X[idx_val]
         Y_train, Y_val = Y[idx_train], Y[idx_val]
 
         if pretrained is None:
-            # Build fresh model for each fold
+            # Build fresh model for each member
             model = build_model_func(input_shape=X_train.shape[1:])
             Y_mean = 0
             Y_std = 3
         else:
-            # Copy a pre-trained member (so it is left untouched), cycling through them, freeze its early
-            # layers, and keep the Y normalisation its output layer learned
-            pretrained_model, Y_mean, Y_std = pretrained[fold % len(pretrained)]
+            # Copy a pre-trained member (so it is left untouched): the same one for every member, or cycling
+            # through them; freeze its early layers, and keep the Y normalisation its output layer learned
+            start = member % len(pretrained) if pretrained_member is None else pretrained_member
+            pretrained_model, Y_mean, Y_std = pretrained[start]
             model = tf.keras.models.clone_model(pretrained_model)
             model.set_weights(pretrained_model.get_weights())
             for layer in model.layers[:N_FROZEN_LAYERS]:

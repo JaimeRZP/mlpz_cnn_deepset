@@ -221,7 +221,7 @@ def plot_ensemble_losses(histories, ylim=(0, 0.1)):
         for metric, s in style.items():
             if metric in history.history:
                 ax.plot(history.history[metric], label=metric, color=s["color"], linestyle=s["linestyle"], linewidth=2)
-        ax.set_title(f"Fold {fold+1}")
+        ax.set_title(f"Member {fold+1}")
         ax.set_xlabel("Epoch")
         ax.set_ylim(ylim)
         ax.grid(True)
@@ -259,6 +259,6 @@ def plot_ensemble_losses(histories, ylim=(0, 0.1)):
     ax_summary.grid(True)
     ax_summary.legend()
 
-    plt.suptitle("Ensemble Model — Loss per Fold", fontsize=14, y=1.02)
+    plt.suptitle("Ensemble Model — Loss per Member", fontsize=14, y=1.02)
     plt.tight_layout()
     plt.show()

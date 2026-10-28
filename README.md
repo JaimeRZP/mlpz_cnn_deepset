@@ -3,9 +3,10 @@
 Photometric redshifts from an ensemble of 1-D convolutional neural networks.
 
 Each galaxy's photometry is turned into a short "spectrum" on a common wavelength grid by spreading
-every band's magnitude over its filter curve. An ensemble of CNNs, one per K-fold split of the
-training set, predicts a redshift from it. The per-object p(z) is a Gaussian whose mean and width
-come from the spread of the ensemble's predictions, optionally including the photometric errors.
+every band's magnitude over its filter curve. An ensemble of CNNs predicts a redshift from it; the
+members share one training/validation split and can each be trained on their own noise realization of
+the training photometry. The per-object p(z) is the histogram of the members' predictions, optionally
+over many noise realizations of the photometry to include the photometric errors.
 
 ## Installation
 
@@ -78,13 +79,17 @@ X_test, _ = znn.catalog_to_XY(test, **features)
      | 2 | coverage: the fraction of the bin backed by observed bands, from 0 to 1 |
 
 2. **An ensemble of CNNs** (`train_ensembles`)
-   - The training set is split K ways (`N_SPLITS`), and one model is trained per fold, using the
-     other folds as its validation set.
+   - `N_SPLITS` members share one split of the training set: they train on `1 - VAL_FRAC` of it and use
+     the other `VAL_FRAC` (default 0.2) as their validation set.
+   - Each member can be given its own inputs: `resampled_inputs` draws one noise realization of the
+     training photometry per member from its errors (just the photometry as given if it has none), so
+     the members differ by noise realization rather than by data cut.
    - Each member predicts a single redshift, trained with an MSE loss. Targets are scaled as z / 3.
    - Training uses early stopping and reduces the learning rate when the validation loss plateaus.
-   - **Pre-training (default):** each member starts from a copy of a pre-trained member, cycling through
-     them (member k starts from pre-trained member k mod K, so any `N_SPLITS` works), with its first two
-     convolutional blocks frozen, and trains with the same settings as from scratch.
+   - **Pre-training (default):** every member starts from a copy of the same pre-trained member
+     (`pretrained_member`, default 0; `None` cycles through them, member k starting from pre-trained
+     member k mod K), with its first two convolutional blocks frozen, and trains with the same settings
+     as from scratch.
      - `pretraining="popcosmos"` (default): a 5-member ensemble shipped with znn
        (`znn/pretrained/popcosmos.{json,npz}`), trained on 200k galaxies of the pop-cosmos mock
        (Zenodo v1.1.0, i < 25.5) in 23 COSMOS2020 bands at their native depth, on the default grid. Its
@@ -96,11 +101,12 @@ X_test, _ = znn.catalog_to_XY(test, **features)
      - Pre-training checks the input shape against the pre-trained models but cannot check the grid itself.
 
 3. **p(z)** (`ensemble_predict`, `ensemble_predict_resampled`)
-   - `ensemble_predict` gives each object a Gaussian with the mean and standard deviation of the K
-     members' predictions.
+   - `ensemble_predict` gives each object the histogram of the K members' predictions (bins
+     `DEFAULT_Z_BINS`, z = 0 to 3 in steps of 0.01; `zmode` is its peak).
    - `ensemble_predict_resampled` also redraws the photometry S times from its errors and runs every
-     member on every draw. The width then includes the photometric errors as well as the
-     disagreement between members.
+     member on every draw; the p(z) is the histogram of all S × K predictions, so it includes the
+     photometric errors as well as the disagreement between members. A catalogue with no errors gets
+     a single draw, the photometry as given.
    - With `return_components=True`, it also returns the two parts of the width, "model" and
      "photometric". They add in quadrature to the total.
 
@@ -109,9 +115,9 @@ X_test, _ = znn.catalog_to_XY(test, **features)
 | Module | Purpose | Main functions |
 |---|---|---|
 | `znn/io.py` | Reading catalogues and filter curves | `read_catalog`, `load_filter_curves`, `catalog_to_mags` |
-| `znn/data.py` | Building CNN inputs and resampling photometry | `catalog_to_XY`, `resample_photometry`, `DEFAULT_FEATURE_CONFIG` |
+| `znn/data.py` | Building CNN inputs and resampling photometry | `catalog_to_XY`, `resample_photometry`, `resampled_inputs`, `DEFAULT_FEATURE_CONFIG` |
 | `znn/models.py` | Architectures, training, prediction, saving and loading | `build_model`, `train_ensembles`, `ensemble_predict`, `ensemble_predict_resampled`, `save_ensemble_file`, `load_ensemble_file`, `save_pretrained`, `load_pretrained` |
-| `znn/qp_output.py` | Packaging predictions as p(z) | `package_predictions`, `save_predictions` |
+| `znn/qp_output.py` | Packaging predictions as p(z) | `package_samples`, `save_predictions`, `DEFAULT_Z_BINS` |
 | `znn/stats.py` | Robust point-estimate statistics | `get_biweight_mean_sigma_outlier`, `get_all_stats`, `stats_to_markdown` |
 | `znn/plotting.py` | Diagnostic plots | `plot_stats`, `compare_binned_stats`, `plot_ensemble_losses`, `visualize_the_data` |
 
