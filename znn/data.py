@@ -14,7 +14,9 @@ __all__ = [
     "transform_data_to_XY",
     "make_incomplete_nir_data",
     "catalog_to_XY",
+    "has_errors",
     "resample_photometry",
+    "resampled_inputs",
 ]
 
 # Processing settings for catalog_to_XY; the bands themselves are always supplied by the user.
@@ -269,6 +271,16 @@ def catalog_to_XY(df, bands, ref_band, config=DEFAULT_FEATURE_CONFIG, filter_cur
     return X, (Y if has_redshift else None)
 
 
+def has_errors(df, errors):
+    """
+    Whether a catalogue has any photometric errors to sample over: at least one of the error columns in
+    `errors` (dict magnitude column -> error column, or None) is in df with a finite value.
+    """
+    return any(
+        err_column in df and np.isfinite(df[err_column].to_numpy(dtype=float)).any() for err_column in (errors or {}).values()
+    )
+
+
 def resample_photometry(df, errors, rng):
     """
     Return a copy of a catalogue with its magnitudes redrawn from their photometric errors: one noise
@@ -279,10 +291,12 @@ def resample_photometry(df, errors, rng):
 
     The noise is Gaussian in flux, f = 10**(-0.4 m) with sigma_f = 0.4 ln(10) f sigma_m, as photometric
     noise is; draws with f <= 0 become non-detections (np.nan). Magnitudes or errors that are not finite
-    (non-detections, unobserved bands) are left unchanged.
+    (non-detections, unobserved bands), and bands whose error column is not in df, are left unchanged.
     """
     out = df.copy()
     for mag_column, err_column in errors.items():
+        if err_column not in df:
+            continue
         mag = df[mag_column].to_numpy(dtype=float)
         err = df[err_column].to_numpy(dtype=float)
         ok = np.isfinite(mag) & np.isfinite(err)
@@ -296,3 +310,25 @@ def resample_photometry(df, errors, rng):
         mag_new[np.flatnonzero(ok)[detected]] = -2.5 * np.log10(flux_new[detected])
         out[mag_column] = mag_new
     return out
+
+
+def resampled_inputs(df, errors, n_realizations, rng, bands, ref_band, config=DEFAULT_FEATURE_CONFIG, filter_curves=None):
+    """
+    CNN inputs for n_realizations independent noise realizations of a catalogue's photometry (see
+    resample_photometry), e.g. one per ensemble member for train_ensembles.
+
+    errors, rng: as for resample_photometry.
+    bands, ref_band, config, filter_curves: as for catalog_to_XY.
+
+    Returns a list of n_realizations arrays X, each of shape (n_sources, n_bins, 3), with the sources in the
+    order of df. If df has no errors (see has_errors) there is only one realization, the photometry as given,
+    and every entry of the list is that same array.
+    """
+    if filter_curves is None:
+        filter_curves = load_filter_curves(bands)
+    if not has_errors(df, errors):
+        return [catalog_to_XY(df, bands, ref_band, config, filter_curves=filter_curves)[0]] * n_realizations
+    return [
+        catalog_to_XY(resample_photometry(df, errors, rng), bands, ref_band, config, filter_curves=filter_curves)[0]
+        for _ in range(n_realizations)
+    ]

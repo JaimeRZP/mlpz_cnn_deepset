@@ -7,9 +7,9 @@ import tensorflow as tf
 from sklearn.model_selection import KFold
 from tensorflow.keras import callbacks, layers, models
 
-from .data import DEFAULT_FEATURE_CONFIG, catalog_to_XY, resample_photometry
+from .data import DEFAULT_FEATURE_CONFIG, catalog_to_XY, has_errors, resample_photometry
 from .io import load_filter_curves
-from .qp_output import package_predictions
+from .qp_output import DEFAULT_Z_BINS, package_samples
 
 __all__ = [
     "build_model",
@@ -86,11 +86,11 @@ def _inputs_per_member(X, n_members):
     return [X] * n_members
 
 
-# --- Prediction: average across all models ---
-def ensemble_predict(trained_models, X_test, ids=None):
+# --- Prediction: pool the predictions of all models ---
+def ensemble_predict(trained_models, X_test, ids=None, bins=DEFAULT_Z_BINS):
     """
     Predict redshifts with an ensemble of models and package the result as a
-    per-object p(z).
+    per-object p(z): the histogram of the members' predictions.
 
     Parameters
     ----------
@@ -100,27 +100,26 @@ def ensemble_predict(trained_models, X_test, ids=None):
         Input features to predict on.
     ids : array-like, optional
         Per-object identifiers. Defaults to the sample order index (0..N-1).
+    bins : array-like
+        Histogram bin edges of the p(z).
 
     Returns
     -------
     qp.Ensemble or pandas.DataFrame
-        A qp Ensemble of per-object Gaussians (mean/std from the ensemble) if
-        qp is installed, otherwise a DataFrame with "object_id", "mean", "std"
-        columns. See :func:`znn.qp_output.package_predictions`.
+        A qp Ensemble of per-object histograms if qp is installed, otherwise a
+        DataFrame with "object_id", "mean", "std" columns. See
+        :func:`znn.qp_output.package_samples`.
     """
     predictions = []
 
     for model, Y_mean, Y_std in trained_models:
         # predict in normalised space, then denormalise
         y_pred_norm = model.predict(X_test)
-        y_pred = y_pred_norm * Y_std + Y_mean  # denormalise
+        y_pred = y_pred_norm.ravel() * Y_std + Y_mean  # denormalise
         predictions.append(y_pred)
 
-    # average predictions across all models
-    y_pred_mean = np.mean(predictions, axis=0)
-    y_pred_std = np.std(predictions, axis=0)
-
-    return package_predictions(y_pred_mean, y_pred_std, ids=ids)
+    # one sample per member and object
+    return package_samples(np.stack(predictions, axis=1), ids=ids, bins=bins)
 
 
 def ensemble_predict_resampled(
@@ -135,37 +134,48 @@ def ensemble_predict_resampled(
     filter_curves=None,
     ids=None,
     return_components=False,
+    bins=DEFAULT_Z_BINS,
 ):
     """
     Predict p(z) with the photometric errors propagated by Monte Carlo.
 
-    Draws n_samples noise realizations of the catalogue's photometry (see resample_photometry), runs
-    every ensemble member on every realization, and packages the n_samples x n_members predictions per
-    object as a Gaussian p(z) with their mean and std. The number of realizations is independent of the
-    number of members.
+    Draws n_samples noise realizations of the catalogue's photometry (see resample_photometry) and runs
+    every ensemble member on every realization. The n_samples x n_members predictions per object are
+    pooled, not averaged over members: the p(z) is their histogram on `bins` (see package_samples). The
+    number of realizations is independent of the number of members. If df has no errors (see
+    has_errors) there is only one realization, the photometry as given, whatever n_samples.
 
     trained_models: list of (model, Y_mean, Y_std), as returned by train_ensembles.
     df: the catalogue to predict on (see znn.io.read_catalog).
     errors: dict magnitude column -> its error column, as for resample_photometry.
-    n_samples: number of noise realizations.
+    n_samples: number of noise realizations, when df has errors.
     rng: numpy Generator, e.g. np.random.default_rng(seed).
     bands, ref_band, config, filter_curves: feature settings, as for catalog_to_XY; a dict of these as
         returned by load_ensemble_file can be passed as **features.
     ids: per-object identifiers for the p(z), as for ensemble_predict.
     return_components: also return the split of the predicted std into its two sources.
+    bins: histogram bin edges of the p(z).
 
-    Returns the p(z) as from ensemble_predict. With return_components, returns (p(z), components), where
-    components holds per-object stds that add in quadrature to the total (law of total variance):
+    Returns the p(z), as a qp Ensemble (or the fallback DataFrame, see package_samples). With
+    return_components, returns (p(z), components), where components holds per-object stds that add in
+    quadrature to the total (law of total variance):
       - "model": spread between members on the same realization, averaged over realizations;
       - "photometric": spread of the ensemble mean across realizations.
     """
+    noisy = has_errors(df, errors)
+    if not noisy:
+        n_samples = 1
+    if filter_curves is None:
+        filter_curves = load_filter_curves(bands)
+
     predictions = np.empty((n_samples, len(trained_models), len(df)))
     for s in range(n_samples):
-        X, _ = catalog_to_XY(resample_photometry(df, errors, rng), bands, ref_band, config, filter_curves=filter_curves)
+        photometry = resample_photometry(df, errors, rng) if noisy else df
+        X, _ = catalog_to_XY(photometry, bands, ref_band, config, filter_curves=filter_curves)
         for k, (model, Y_mean, Y_std) in enumerate(trained_models):
             predictions[s, k] = model.predict(X, batch_size=4096, verbose=0).ravel() * Y_std + Y_mean
 
-    pz = package_predictions(predictions.mean(axis=(0, 1)), predictions.std(axis=(0, 1)), ids=ids)
+    pz = package_samples(predictions.reshape(-1, len(df)).T, ids=ids, bins=bins)
     if not return_components:
         return pz
 
