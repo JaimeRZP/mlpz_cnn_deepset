@@ -13,8 +13,6 @@ from .qp_output import package_samples
 
 __all__ = [
     "build_model",
-    "build_model_v2",
-    "build_model_small",
     "ensemble_predict",
     "predict_from_catalog",
     "ensemble_predict_resampled",
@@ -51,47 +49,6 @@ def build_model(input_shape):
             layers.Conv1D(512, kernel_size=3, activation="relu", padding="same"),
             layers.GlobalAveragePooling1D(),
             layers.Dense(64, activation="relu"),
-            layers.Dropout(0.3),
-            layers.Dense(1),
-        ]
-    )
-    return model
-
-
-def build_model_v2(input_shape):
-    # 5 layers
-    model = models.Sequential(
-        [
-            layers.Conv1D(32, kernel_size=3, activation="relu", padding="same", input_shape=input_shape),
-            layers.MaxPooling1D(),
-            layers.Conv1D(64, kernel_size=3, activation="relu", padding="same"),
-            layers.MaxPooling1D(),
-            layers.Conv1D(128, kernel_size=3, activation="relu", padding="same"),
-            layers.MaxPooling1D(),
-            layers.Conv1D(256, kernel_size=3, activation="relu", padding="same"),
-            layers.MaxPooling1D(),
-            layers.Conv1D(512, kernel_size=3, activation="relu", padding="same"),
-            layers.GlobalAveragePooling1D(),
-            layers.Dense(64, activation="relu"),
-            layers.Dropout(0.3),
-            layers.Dense(1),
-        ]
-    )
-    return model
-
-
-def build_model_small(input_shape):
-    # 4 layers, LeNet-sized (~22k parameters against ~1.3M for build_model)
-    model = models.Sequential(
-        [
-            layers.Conv1D(16, kernel_size=3, activation="relu", padding="same", input_shape=input_shape),
-            layers.MaxPooling1D(),
-            layers.Conv1D(32, kernel_size=3, activation="relu", padding="same"),
-            layers.MaxPooling1D(),
-            layers.Conv1D(64, kernel_size=3, activation="relu", padding="same"),
-            layers.Conv1D(64, kernel_size=3, activation="relu", padding="same"),
-            layers.GlobalAveragePooling1D(),
-            layers.Dense(32, activation="relu"),
             layers.Dropout(0.3),
             layers.Dense(1),
         ]
