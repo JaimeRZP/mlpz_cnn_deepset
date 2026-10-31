@@ -14,6 +14,11 @@ from .qp_output import package_predictions
 __all__ = [
     "build_model",
     "build_model_v2",
+    "build_model_v2_k7",
+    "build_model_res_se",
+    "TARGETS",
+    "LOSSES",
+    "ToRedshift",
     "ensemble_predict",
     "ensemble_predict_resampled",
     "save_ensemble",
@@ -68,6 +73,135 @@ def build_model_v2(input_shape):
         ]
     )
     return model
+
+
+def build_model_v2_k7(input_shape):
+    # build_model_v2 with a first kernel of 7, so the first layer sees the broad shape of the SED
+    model = models.Sequential(
+        [
+            layers.Conv1D(32, kernel_size=7, activation="relu", padding="same", input_shape=input_shape),
+            layers.MaxPooling1D(),
+            layers.Conv1D(64, kernel_size=3, activation="relu", padding="same"),
+            layers.MaxPooling1D(),
+            layers.Conv1D(128, kernel_size=3, activation="relu", padding="same"),
+            layers.MaxPooling1D(),
+            layers.Conv1D(256, kernel_size=3, activation="relu", padding="same"),
+            layers.MaxPooling1D(),
+            layers.Conv1D(512, kernel_size=3, activation="relu", padding="same"),
+            layers.GlobalAveragePooling1D(),
+            layers.Dense(64, activation="relu"),
+            layers.Dropout(0.3),
+            layers.Dense(1),
+        ]
+    )
+    return model
+
+
+def _squeeze_excite(x, ratio=4):
+    """Channel attention: reweight each channel by a gate computed from its average over wavelength."""
+    channels = x.shape[-1]
+    s = layers.GlobalAveragePooling1D()(x)
+    s = layers.Dense(max(channels // ratio, 4), activation="relu")(s)
+    s = layers.Dense(channels, activation="sigmoid")(s)
+    s = layers.Reshape((1, channels))(s)
+    return layers.Multiply()([x, s])
+
+
+def _residual_se_block(x, width, kernel_size=3):
+    """Two conv-BN layers and a squeeze-excitation gate, added to an identity skip (1x1 conv if the width changes)."""
+    shortcut = x
+    if x.shape[-1] != width:
+        shortcut = layers.Conv1D(width, kernel_size=1, use_bias=False)(x)
+        shortcut = layers.BatchNormalization()(shortcut)
+
+    y = layers.Conv1D(width, kernel_size=kernel_size, padding="same", use_bias=False)(x)
+    y = layers.BatchNormalization()(y)
+    y = layers.Activation("relu")(y)
+    y = layers.Conv1D(width, kernel_size=kernel_size, padding="same", use_bias=False)(y)
+    y = layers.BatchNormalization()(y)
+    y = _squeeze_excite(y)
+
+    y = layers.Add()([shortcut, y])
+    return layers.Activation("relu")(y)
+
+
+def build_model_res_se(input_shape):
+    # residual squeeze-excitation net: kernel-7 stem, 3 stages (32/64/128 filters) of 2 blocks each,
+    # pooling after the first two stages (32 -> 16 -> 8 positions), then the same head as build_model.
+    # ~270k parameters, a fifth of build_model; train it with target="log1pz" (see train_ensembles)
+    inputs = layers.Input(shape=input_shape)
+    x = layers.Conv1D(32, kernel_size=7, padding="same", use_bias=False)(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+
+    for stage, width in enumerate([32, 64, 128]):
+        x = _residual_se_block(x, width)
+        x = _residual_se_block(x, width)
+        if stage < 2:
+            x = layers.MaxPooling1D()(x)
+
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dense(64, activation="relu")(x)
+    x = layers.Dropout(0.3)(x)
+    outputs = layers.Dense(1)(x)
+    return models.Model(inputs, outputs)
+
+
+# --- Target scaling and loss ---
+# Targets: "z3" scales the redshift as z / 3 (the original scheme); "log1pz" standardises log(1 + z) with
+# the mean and std of each fold's training redshifts.
+TARGETS = ("z3", "log1pz")
+# Losses: "mse", or "huber" with its delta given in dz / (1 + z) (see _make_loss).
+LOSSES = ("mse", "huber")
+
+
+@tf.keras.utils.register_keras_serializable(package="znn")
+class ToRedshift(layers.Layer):
+    """Map a standardised log(1 + z) output back to redshift: z = exp(y * std + mean) - 1."""
+
+    def __init__(self, mean, std, **kwargs):
+        super().__init__(**kwargs)
+        self.mean = float(mean)
+        self.std = float(std)
+
+    def call(self, y):
+        return tf.math.expm1(y * self.std + self.mean)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"mean": self.mean, "std": self.std})
+        return config
+
+
+def _make_loss(loss, target, Y_train, Y_std, huber_delta):
+    """
+    Keras loss in the normalised units the model is trained in.
+
+    The Huber delta is given in log(1 + z), i.e. roughly in dz / (1 + z), so it means the same for both targets:
+      - log1pz: delta / Y_std;
+      - z3: an error of delta in log(1 + z) is delta * (1 + z) in z, taken at the median training redshift.
+    """
+    if loss == "mse":
+        return "mse"
+    if loss == "huber":
+        if target == "log1pz":
+            return tf.keras.losses.Huber(delta=huber_delta / Y_std)
+        return tf.keras.losses.Huber(delta=huber_delta * (1 + np.median(Y_train)) / Y_std)
+    raise ValueError(f"unknown loss '{loss}'. Available: {LOSSES}")
+
+
+def _as_ensemble_member(model, target, Y_mean, Y_std):
+    """
+    Package a trained model as a (model, Y_mean, Y_std) ensemble member.
+
+    Members are denormalised linearly, as model.predict(X) * Y_std + Y_mean. z3 is linear, so the member is
+    (model, Y_mean, Y_std). log1pz is not, so a ToRedshift layer is appended and the member is (model, 0, 1):
+    the model then outputs z, and ensemble_predict, ensemble_predict_resampled and saving/loading work as is.
+    """
+    if target == "z3":
+        return model, Y_mean, Y_std
+    outputs = ToRedshift(Y_mean, Y_std)(model.outputs[0])
+    return models.Model(model.inputs[0], outputs), 0.0, 1.0
 
 
 def _inputs_per_member(X, n_members):
@@ -272,13 +406,39 @@ def load_ensemble_file(path):
     return trained_models, payload["features"]
 
 
-def train_ensembles(build_model_func, X, Y, N_SPLITS=10, EPOCHS=100, BATCH_SIZE=256, random_state=42):
+def train_ensembles(
+    build_model_func,
+    X,
+    Y,
+    N_SPLITS=10,
+    EPOCHS=100,
+    BATCH_SIZE=256,
+    random_state=42,
+    target="z3",
+    loss="mse",
+    huber_delta=0.05,
+):
     """
-    Train one model per K-fold split, each predicting a point redshift trained with MSE.
+    Train one model per K-fold split, each predicting a point redshift.
 
     X is either one feature array shared by all members, or a list of N_SPLITS arrays (same objects, in
     the same order as Y), one per member, e.g. a different photometric noise realization for each.
+
+    target: how the redshift is scaled for training (see TARGETS).
+      - "z3" (default): z / 3, the original scheme.
+      - "log1pz": log(1 + z), standardised with each fold's training mean and std. A ToRedshift layer is
+        appended to each trained model so it outputs z, and the member is (model, 0, 1).
+    loss: "mse" (default) or "huber" (see LOSSES).
+    huber_delta: the Huber delta in dz / (1 + z); only used with loss="huber".
+
+    The defaults reproduce the original training. The best setups from the architecture tests were
+    build_model_res_se and build_model_v2_k7 with target="log1pz", and build_model_res_se with
+    target="log1pz", loss="huber".
     """
+    if target not in TARGETS:
+        raise ValueError(f"unknown target '{target}'. Available: {TARGETS}")
+    if loss not in LOSSES:
+        raise ValueError(f"unknown loss '{loss}'. Available: {LOSSES}")
     X_members = _inputs_per_member(X, N_SPLITS)
     kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=random_state)
 
@@ -302,14 +462,19 @@ def train_ensembles(build_model_func, X, Y, N_SPLITS=10, EPOCHS=100, BATCH_SIZE=
 
         # Normalise Y using train statistics only
         # Y_mean, Y_std = Y_train.mean(), Y_train.std()
-        Y_mean = 0
-        Y_std = 3
-        Y_train_norm = (Y_train - Y_mean) / Y_std
-        Y_val_norm = (Y_val - Y_mean) / Y_std
+        if target == "z3":
+            Y_mean = 0
+            Y_std = 3
+            Y_train_norm = (Y_train - Y_mean) / Y_std
+            Y_val_norm = (Y_val - Y_mean) / Y_std
+        else:  # "log1pz"
+            Y_mean, Y_std = float(np.log1p(Y_train).mean()), float(np.log1p(Y_train).std())
+            Y_train_norm = (np.log1p(Y_train) - Y_mean) / Y_std
+            Y_val_norm = (np.log1p(Y_val) - Y_mean) / Y_std
 
         # Build fresh model for each fold
         model = build_model_func(input_shape=X_train.shape[1:])
-        model.compile(optimizer="adam", loss="mse")
+        model.compile(optimizer="adam", loss=_make_loss(loss, target, Y_train, Y_std, huber_delta))
 
         # Train
         history = model.fit(
@@ -322,7 +487,7 @@ def train_ensembles(build_model_func, X, Y, N_SPLITS=10, EPOCHS=100, BATCH_SIZE=
             verbose=2,
         )
 
-        trained_models.append((model, Y_mean, Y_std))  # save model + its normalisation
+        trained_models.append(_as_ensemble_member(model, target, Y_mean, Y_std))  # save model + its normalisation
         histories.append(history)
 
     return trained_models, histories
