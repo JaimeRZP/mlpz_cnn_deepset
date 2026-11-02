@@ -646,12 +646,14 @@ def _train_member(
     target="z3",
     loss="mse",
     huber_delta=0.05,
+    freeze=True,
 ):
     """
     Train one member on X[idx_train], with X[idx_val] for early stopping and learning-rate reduction: from
     scratch with build_model_func (start None), or from a copy of start = (model, Y_mean, Y_std) with its first
     N_FROZEN_LAYERS layers frozen, as well as any layer frozen in start (e.g. by a pre-training's frozen_until, and
-    so in every model trained from it), and its Y normalisation kept. With monitor False, X[idx_val] only goes in the
+    so in every model trained from it), and its Y normalisation kept. With freeze False, nothing of start is frozen:
+    it is only the starting point of every layer. With monitor False, X[idx_val] only goes in the
     history: the member trains for all EPOCHS at a constant LEARNING_RATE. Returns ((model, Y_mean, Y_std), history).
 
     target and loss are as for train_ensembles; a start must have been trained with the same target. A log1pz
@@ -678,22 +680,24 @@ def _train_member(
         else:  # "log1pz": standardised with this member's training redshifts
             Y_mean, Y_std = float(np.log1p(Y_train).mean()), float(np.log1p(Y_train).std())
     else:
-        # Copy the start (so it is left untouched), freeze its early layers, and keep the Y normalisation its
-        # output layer learned
+        # Copy the start (so it is left untouched), freeze its early layers (unless freeze is False), and keep the Y
+        # normalisation its output layer learned
         start_model, Y_mean, Y_std = start
         model = tf.keras.models.clone_model(start_model)
         model.set_weights(start_model.get_weights())
-        # what is frozen in start stays so (layers without weights, e.g. the input, which cloning may rename, aside)
+        # what is frozen in start stays so, or with freeze False nothing is (layers without weights, e.g. the input,
+        # which cloning may rename, aside)
         for start_layer in start_model.layers:
             if start_layer.weights:
-                model.get_layer(start_layer.name).trainable = start_layer.trainable
+                model.get_layer(start_layer.name).trainable = start_layer.trainable if freeze else True
         if target == "log1pz":
             # train the network under ToRedshift, in the standardised log(1 + z) it was pre-trained in
             to_z = model.layers[-1]
             Y_mean, Y_std = to_z.mean, to_z.std
             model = models.Model(model.inputs[0], to_z.input)
-        for layer in model.layers[:N_FROZEN_LAYERS]:
-            layer.trainable = False
+        if freeze:
+            for layer in model.layers[:N_FROZEN_LAYERS]:
+                layer.trainable = False
 
     T_train, T_val = (Y_train, Y_val) if target == "z3" else (np.log1p(Y_train), np.log1p(Y_val))
 
@@ -731,6 +735,7 @@ def train_ensembles(
     target="z3",
     loss="mse",
     huber_delta=0.05,
+    freeze=True,
 ):
     """
     Train an ensemble of N_SPLITS models from prebuilt inputs, each predicting a point redshift.
@@ -762,6 +767,8 @@ def train_ensembles(
       e.g. the whole first residual block of build_model_res_se), or else the first N_FROZEN_LAYERS; everything else (optimizer, learning rate, epochs,
       callbacks, split) is as from scratch, and build_model_func only selects and checks the pre-training. The
       pre-trained model is not modified.
+    freeze: with pre-training, freeze its early layers as above (True, default), or nothing (False): the pre-trained
+      model is then only the starting point of every layer, and the whole network trains.
 
     target: how the redshift is scaled for training (see TARGETS).
       - "z3" (default): z / 3, the original scheme.
@@ -791,7 +798,7 @@ def train_ensembles(
         print(f"\n--- Member {member+1}/{N_SPLITS} ---")
         trained, history = _train_member(
             build_model_func, X_members[member], Y, idx_train, idx_val, start, EPOCHS, BATCH_SIZE, LEARNING_RATE,
-            target=target, loss=loss, huber_delta=huber_delta,
+            target=target, loss=loss, huber_delta=huber_delta, freeze=freeze,
         )
         trained_models.append(trained)
         histories.append(history)
@@ -812,13 +819,14 @@ def train_model(
     target="z3",
     loss="mse",
     huber_delta=0.05,
+    freeze=True,
 ):
     """
     Train a single model from prebuilt inputs, e.g. a pre-training (see save_pretrained).
 
     A random VAL_FRAC of the objects (by random_state) is held out for early stopping and learning-rate reduction,
     and the model trains on the rest, as the base model of train_from_catalog(from_base=True). Everything else
-    (pretraining, LEARNING_RATE, target, loss, huber_delta) is as for train_ensembles.
+    (pretraining, LEARNING_RATE, target, loss, huber_delta, freeze) is as for train_ensembles.
 
     Returns ((model, Y_mean, Y_std), history): a one-member ensemble is [(model, Y_mean, Y_std)].
     """
@@ -830,7 +838,7 @@ def train_model(
     idx_train, idx_val = train_test_split(np.arange(len(Y)), test_size=VAL_FRAC, random_state=random_state)
     return _train_member(
         build_model_func, X, Y, idx_train, idx_val, start, EPOCHS, BATCH_SIZE, LEARNING_RATE,
-        target=target, loss=loss, huber_delta=huber_delta,
+        target=target, loss=loss, huber_delta=huber_delta, freeze=freeze,
     )
 
 
@@ -856,6 +864,7 @@ def train_from_catalog(
     target="z3",
     loss="mse",
     huber_delta=0.05,
+    freeze=True,
 ):
     """
     Train an ensemble of N_MEMBERS models on a catalogue, each on its own noise realization of the
@@ -869,6 +878,12 @@ def train_from_catalog(
     The objects are split K-fold, K = N_MEMBERS, as in train_ensembles. pretraining, random_state, target,
     loss and huber_delta are as for train_ensembles. With from_base, the base model and the members fine-tuned
     from it are all trained with target.
+
+    freeze: as for train_ensembles, for what is trained from `pretraining`: the base model with from_base, every
+    member without. freeze=False with from_base uses the pre-training only as the starting point of the base model's
+    every layer; the members are then fine-tuned from the base as from a base trained from scratch (its first
+    N_FROZEN_LAYERS layers frozen, the same in every member), so the run differs from one from scratch only by the
+    base model's starting point.
 
     from_base: train in two stages, cheaper per member:
       1. a base model, from `pretraining`, on all the objects and the photometry as given (a random VAL_FRAC
@@ -912,7 +927,7 @@ def train_from_catalog(
         idx_train, idx_val = train_test_split(np.arange(len(Y)), test_size=VAL_FRAC, random_state=random_state)
         start, base_history = _train_member(
             build_model_func, X_given, Y, idx_train, idx_val, start, EPOCHS, BATCH_SIZE, 1e-3,
-            target=target, loss=loss, huber_delta=huber_delta,
+            target=target, loss=loss, huber_delta=huber_delta, freeze=freeze,
         )
         epochs, learning_rate, monitor = FINETUNE_EPOCHS, FINETUNE_LR, False
 
@@ -921,9 +936,10 @@ def train_from_catalog(
     for member, (idx_train, idx_val) in enumerate(_kfold_cuts(len(Y), N_MEMBERS, random_state)):
         print(f"\n--- Member {member+1}/{N_MEMBERS}" + (" (its own noise realization)" if noisy else "") + " ---")
         X = inputs(resample_photometry(df, errors, rng)) if noisy else X_given
+        # fine-tuned from the base: frozen as from any base; without from_base, from `pretraining`, as freeze says
         trained, history = _train_member(
             build_model_func, X, Y, idx_train, idx_val, start, epochs, BATCH_SIZE, learning_rate, monitor,
-            target=target, loss=loss, huber_delta=huber_delta,
+            target=target, loss=loss, huber_delta=huber_delta, freeze=True if from_base else freeze,
         )
         trained_models.append(trained)
         histories.append(history)
