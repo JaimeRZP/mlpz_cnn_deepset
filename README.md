@@ -46,6 +46,11 @@ models, histories, _ = znn.train_from_catalog(
     znn.build_model, train, train["redshift"].to_numpy(), BANDS, REF_BAND, errors=errors,
     rng=np.random.default_rng(42), N_MEMBERS=5,
 )
+# or the residual squeeze-excitation net, from scratch, with a log(1 + z) target and a Huber loss
+models, histories, _ = znn.train_from_catalog(
+    znn.build_model_res_se, train, train["redshift"].to_numpy(), BANDS, REF_BAND, errors=errors,
+    rng=np.random.default_rng(42), N_MEMBERS=5, pretraining=None, target="log1pz", loss="huber",
+)
 
 # p(z) with the photometric errors propagated: 50 noise draws, each through every member
 pz = znn.predict_from_catalog(
@@ -111,6 +116,21 @@ X_test, _ = znn.catalog_to_XY(test, **features)
        `save_pretrained` path; of an ensemble, its first member is used. Its inputs must be on the same grid
        as yours.
      - Pre-training checks the input shape against the pre-trained models but cannot check the grid itself.
+   - Options for training from scratch (the defaults reproduce the above; with pre-training the
+     pre-trained model's normalisation is kept):
+     - `target="log1pz"` trains on log(1 + z), standardised with each member's training mean and std.
+       A `ToRedshift` layer is appended to each trained model, so it still outputs z.
+     - `loss="huber"` uses a Huber loss; `huber_delta` (default 0.05) is given in dz / (1 + z).
+
+   | Architecture | Parameters | Description |
+   |---|---|---|
+   | `build_model` | 1.34M | 6 convs, 3 poolings, global average pooling, dense head |
+   | `build_model_v2_k7` | 557k | 5 convs, 4 poolings, a first kernel of 7, same head |
+   | `build_model_res_se` | 273k | residual net with squeeze-excitation: kernel-7 stem, 3 stages of 2 blocks, same head |
+
+   The shipped pre-training is a `build_model`, so the other architectures need `pretraining=None`.
+   The best setups found were `build_model_res_se` with `target="log1pz"` (MSE or Huber), then
+   `build_model_v2_k7` with `target="log1pz"`. The log(1 + z) target helped every architecture.
 
 3. **p(z)** (`predict_from_catalog`, built on `ensemble_predict`)
    - `predict_from_catalog` redraws the catalogue's photometry S times (`n_samples`) from its errors and
@@ -128,7 +148,7 @@ X_test, _ = znn.catalog_to_XY(test, **features)
 |---|---|---|
 | `znn/io.py` | Reading catalogues and filter curves | `read_catalog`, `load_filter_curves`, `catalog_to_mags` |
 | `znn/data.py` | Building CNN inputs and resampling photometry | `catalog_to_XY`, `resample_photometry`, `has_errors`, `DEFAULT_FEATURE_CONFIG` |
-| `znn/models.py` | Architectures, training, prediction, saving and loading | `build_model`, `train_from_catalog`, `predict_from_catalog`, `train_ensembles`, `ensemble_predict`, `save_ensemble_file`, `load_ensemble_file`, `save_pretrained`, `load_pretrained` |
+| `znn/models.py` | Architectures, target scaling, losses, training, prediction, saving and loading | `build_model`, `build_model_v2_k7`, `build_model_res_se`, `train_from_catalog`, `predict_from_catalog`, `train_ensembles`, `ensemble_predict`, `save_ensemble_file`, `load_ensemble_file`, `save_pretrained`, `load_pretrained` |
 | `znn/qp_output.py` | Packaging predictions as p(z) | `package_samples`, `save_predictions` |
 | `znn/stats.py` | Robust point-estimate statistics | `get_biweight_mean_sigma_outlier`, `get_all_stats`, `stats_to_markdown` |
 | `znn/plotting.py` | Diagnostic plots | `plot_stats`, `compare_binned_stats`, `plot_ensemble_losses`, `visualize_the_data` |
@@ -173,11 +193,15 @@ The lower-level steps behind `catalog_to_XY` live in `data.py` and are useful on
 **Ensembles**
 - A trained ensemble is a list of `(model, Y_mean, Y_std)` tuples, one per member. Predictions are
   `model.predict(X) * Y_std + Y_mean`.
+- With `target="log1pz"` the model ends in a `ToRedshift` layer that outputs z, and the member is
+  `(model, 0, 1)`, so every prediction and saving function works unchanged.
 
 **Saved models**
 - `save_ensemble_file` writes one pickle holding each member's architecture and weights, plus the
   feature settings and the filter curves themselves. Estimation then does not need the filter
   files.
+- `ToRedshift` is registered with Keras when `znn` is imported, so log(1 + z) ensembles load like
+  any other.
 - `save_ensemble` / `load_ensemble` write the older layout: a directory of `.keras` files and
   `norm_params.json`.
 
