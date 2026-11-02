@@ -459,7 +459,7 @@ def pretrained_name(name, build_model_func, target):
     return f"{name}_{build_model_func.__name__}_{target}"
 
 
-def save_pretrained(path, trained_models, config, info=None, *, build_model_func):
+def save_pretrained(path, trained_models, config, info=None, *, build_model_func, frozen_until=None):
     """
     Save an ensemble as a pre-training starting point: <path>.json (architecture, Y normalisations, feature
     config, provenance) and <path>.npz (weights). No pickle, so loading it cannot run code.
@@ -472,10 +472,15 @@ def save_pretrained(path, trained_models, config, info=None, *, build_model_func
     info: optional dict of provenance (training data, settings, versions), stored as is.
     build_model_func: the function the members were built with. Its name is stored with the target the members
         were trained with, and both are checked against those of any training started from this pre-training.
+    frozen_until: the name of a layer of the members. Training started from this pre-training keeps that layer and
+        every layer it depends on frozen (see _freeze_until), e.g. "activation_2", the end of the first residual
+        block of build_model_res_se. None (default): the first N_FROZEN_LAYERS layers.
 
     To ship a pre-training with znn, save it to os.path.join(PRETRAINED_DIR, pretrained_name(name,
     build_model_func, target)).
     """
+    if frozen_until is not None:
+        trained_models[0][0].get_layer(frozen_until)  # raises if the members have no such layer
     architecture = trained_models[0][0].to_json()
     members = []
     for model, Y_mean, Y_std in trained_models:
@@ -486,6 +491,7 @@ def save_pretrained(path, trained_models, config, info=None, *, build_model_func
     meta = {
         "build_model": build_model_func.__name__,
         "target": _model_target(trained_models[0][0]),
+        "frozen_until": frozen_until,
         "architecture": architecture,
         "members": members,
         "config": {k: (list(v) if isinstance(v, tuple) else v) for k, v in config.items()},
@@ -561,7 +567,8 @@ def _resolve_pretraining(pretraining, build_model_func, target):
     """
     The pre-trained start as (model, Y_mean, Y_std): the first member of the given ensemble; None from scratch. A
     shipped pre-training is the variant of build_model_func's architecture and target; one given by path must have
-    been saved with the same build_model_func. The target of any start is checked by _check_target.
+    been saved with the same build_model_func. The target of any start is checked by _check_target. The layers a
+    save_pretrained pair names in frozen_until are marked frozen (see _freeze_until).
     """
     if pretraining is None:
         return None
@@ -574,12 +581,21 @@ def _resolve_pretraining(pretraining, build_model_func, target):
                 f"the pre-training '{pretraining}' is a {meta['build_model']}, not a {build_model_func.__name__}; "
                 "use a pre-training of this architecture, or pass pretraining=None"
             )
+        if meta.get("frozen_until"):
+            _freeze_until(trained_models[0][0], meta["frozen_until"])
         return trained_models[0]
     return list(pretraining)[0]
 
 
-# Layers kept fixed when training from a pre-trained model: the first two conv + pooling blocks
+# Layers kept fixed when training from a pre-trained model: the first two conv + pooling blocks of build_model. A
+# pre-training can set its own instead (frozen_until, see save_pretrained)
 N_FROZEN_LAYERS = 4
+
+
+def _freeze_until(model, name):
+    """Freeze the layer called name and every layer its output depends on, whatever order model.layers lists them in."""
+    for layer in models.Model(model.inputs, model.get_layer(name).output).layers:
+        layer.trainable = False
 
 
 def _check_inputs(start, input_shape):
@@ -634,7 +650,8 @@ def _train_member(
     """
     Train one member on X[idx_train], with X[idx_val] for early stopping and learning-rate reduction: from
     scratch with build_model_func (start None), or from a copy of start = (model, Y_mean, Y_std) with its first
-    N_FROZEN_LAYERS layers frozen and its Y normalisation kept. With monitor False, X[idx_val] only goes in the
+    N_FROZEN_LAYERS layers frozen, as well as any layer frozen in start (e.g. by a pre-training's frozen_until, and
+    so in every model trained from it), and its Y normalisation kept. With monitor False, X[idx_val] only goes in the
     history: the member trains for all EPOCHS at a constant LEARNING_RATE. Returns ((model, Y_mean, Y_std), history).
 
     target and loss are as for train_ensembles; a start must have been trained with the same target. A log1pz
@@ -666,6 +683,10 @@ def _train_member(
         start_model, Y_mean, Y_std = start
         model = tf.keras.models.clone_model(start_model)
         model.set_weights(start_model.get_weights())
+        # what is frozen in start stays so (layers without weights, e.g. the input, which cloning may rename, aside)
+        for start_layer in start_model.layers:
+            if start_layer.weights:
+                model.get_layer(start_layer.name).trainable = start_layer.trainable
         if target == "log1pz":
             # train the network under ToRedshift, in the standardised log(1 + z) it was pre-trained in
             to_z = model.layers[-1]
@@ -736,8 +757,9 @@ def train_ensembles(
         (model, Y_mean, Y_std) as returned by train_ensembles; of an ensemble, the first member is used. Its
         inputs must be on the same grid as X, and it must have been trained with target; a save_pretrained pair
         must also have been saved with build_model_func.
-      With pre-training, every member starts from a copy of that model, with its first N_FROZEN_LAYERS
-      layers frozen and its Y normalisation kept; everything else (optimizer, learning rate, epochs,
+      With pre-training, every member starts from a copy of that model, with its early layers frozen and its Y
+      normalisation kept. The frozen layers are those the pre-training names (frozen_until, see save_pretrained;
+      e.g. the whole first residual block of build_model_res_se), or else the first N_FROZEN_LAYERS; everything else (optimizer, learning rate, epochs,
       callbacks, split) is as from scratch, and build_model_func only selects and checks the pre-training. The
       pre-trained model is not modified.
 
@@ -853,7 +875,8 @@ def train_from_catalog(
          of them is held out for its early stopping), up to EPOCHS epochs;
       2. every member is a copy of the base model fine-tuned on its own noise realization and data cut, at
          the learning rate FINETUNE_LR for FINETUNE_EPOCHS epochs, with the base model's first N_FROZEN_LAYERS
-         layers frozen and its Y normalisation.
+         layers frozen, and those frozen in the base model (by the pre-training it started from), and its Y
+         normalisation.
       The base model has seen every member's validation objects, so their validation loss cannot tell a better
       member from one that stays close to the base: the fine-tuning has no early stopping or learning-rate
       reduction, and runs all FINETUNE_EPOCHS at a constant FINETUNE_LR. Without from_base every member is trained in full from `pretraining` (up to EPOCHS, at the
