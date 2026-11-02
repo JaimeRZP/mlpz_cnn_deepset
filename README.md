@@ -105,21 +105,31 @@ X_test, _ = znn.catalog_to_XY(test, **features)
    - Full training uses early stopping and reduces the learning rate when the validation loss plateaus.
    - **Pre-training (default):** every member starts from a copy of one pre-trained model, with its
      first two convolutional blocks frozen, and trains with the same settings as from scratch.
-     - `pretraining="popcosmos"` (default): a model shipped with znn
-       (`znn/pretrained/popcosmos.{json,npz}`; member 0 of a 5-member ensemble, the others dropped since
-       starting every member from one model scored as well), trained on 200k galaxies of the pop-cosmos mock
-       (Zenodo v1.1.0, i < 25.5) in 23 COSMOS2020 bands at their native depth, on the default grid. Its
-       inputs used the default feature config, so yours must too. `znn.load_pretrained()` returns it with
-       its config and provenance.
+     - `pretraining="popcosmos"` (default): a model shipped with znn, trained on 200k galaxies of the
+       pop-cosmos mock (Zenodo v1.1.0, i < 25.5) in 23 COSMOS2020 bands at their native depth, on the
+       default grid. Its inputs used the default feature config, so yours must too.
+     - Shipped pre-trainings are named after the options they were trained with:
+       `znn/pretrained/<name>_<build_model_func>_<target>.{json,npz}` (`znn.pretrained_name`). The
+       variant matching the `build_model_func` and `target` you train with is loaded, and an error lists
+       the shipped variants if there is none. Shipped so far: `popcosmos_build_model_z3` (member 0 of a
+       5-member ensemble, the others dropped since starting every member from one model scored as well).
+       `znn.load_pretrained("popcosmos", build_model_func, target)` returns a variant with its config and
+       provenance.
      - `pretraining=None`: train every member from scratch.
      - Your own: a list of `(model, Y_mean, Y_std)`, a `save_ensemble_file` `.pkl` path, or a
        `save_pretrained` path; of an ensemble, its first member is used. Its inputs must be on the same grid
-       as yours.
+       as yours, it must have been trained with the same `target`, and a `save_pretrained` pair must have
+       been saved with the same `build_model_func`.
      - Pre-training checks the input shape against the pre-trained models but cannot check the grid itself.
-   - Options for training from scratch (the defaults reproduce the above; with pre-training the
-     pre-trained model's normalisation is kept):
+     - To add a pre-training: train one model with `member, _ = znn.train_model(build_model_func, X, Y,
+       pretraining=None, target=target)` (a random `VAL_FRAC` held out for early stopping), then
+       `znn.save_pretrained(os.path.join(znn.PRETRAINED_DIR, znn.pretrained_name(name, build_model_func, target)), [member], config, info, build_model_func=build_model_func)`.
+       `popcosmos_pretraining.ipynb` does this on the pop-cosmos mock.
+   - Options (the defaults reproduce the above):
      - `target="log1pz"` trains on log(1 + z), standardised with each member's training mean and std.
-       A `ToRedshift` layer is appended to each trained model, so it still outputs z.
+       A `ToRedshift` layer is appended to each trained model, so it still outputs z. A pre-trained
+       model must have been trained with the same `target` (an error is raised otherwise); a log1pz one
+       is fine-tuned in the log(1 + z) normalisation it was pre-trained with.
      - `loss="huber"` uses a Huber loss; `huber_delta` (default 0.05) is given in dz / (1 + z).
 
    | Architecture | Parameters | Description |
@@ -128,7 +138,8 @@ X_test, _ = znn.catalog_to_XY(test, **features)
    | `build_model_v2_k7` | 557k | 5 convs, 4 poolings, a first kernel of 7, same head |
    | `build_model_res_se` | 273k | residual net with squeeze-excitation: kernel-7 stem, 3 stages of 2 blocks, same head |
 
-   The shipped pre-training is a `build_model`, so the other architectures need `pretraining=None`.
+   Only `build_model` has a shipped pre-training so far, so the other architectures need
+   `pretraining=None` until one of theirs is added.
    The best setups found were `build_model_res_se` with `target="log1pz"` (MSE or Huber), then
    `build_model_v2_k7` with `target="log1pz"`. The log(1 + z) target helped every architecture.
 
@@ -148,7 +159,7 @@ X_test, _ = znn.catalog_to_XY(test, **features)
 |---|---|---|
 | `znn/io.py` | Reading catalogues and filter curves | `read_catalog`, `load_filter_curves`, `catalog_to_mags` |
 | `znn/data.py` | Building CNN inputs and resampling photometry | `catalog_to_XY`, `resample_photometry`, `has_errors`, `DEFAULT_FEATURE_CONFIG` |
-| `znn/models.py` | Architectures, target scaling, losses, training, prediction, saving and loading | `build_model`, `build_model_v2_k7`, `build_model_res_se`, `train_from_catalog`, `predict_from_catalog`, `train_ensembles`, `ensemble_predict`, `save_ensemble_file`, `load_ensemble_file`, `save_pretrained`, `load_pretrained` |
+| `znn/models.py` | Architectures, target scaling, losses, training, prediction, saving and loading | `build_model`, `build_model_v2_k7`, `build_model_res_se`, `train_from_catalog`, `predict_from_catalog`, `train_ensembles`, `train_model`, `ensemble_predict`, `save_ensemble_file`, `load_ensemble_file`, `save_pretrained`, `load_pretrained` |
 | `znn/qp_output.py` | Packaging predictions as p(z) | `package_samples`, `save_predictions` |
 | `znn/stats.py` | Robust point-estimate statistics | `get_biweight_mean_sigma_outlier`, `get_all_stats`, `stats_to_markdown` |
 | `znn/plotting.py` | Diagnostic plots | `plot_stats`, `compare_binned_stats`, `plot_ensemble_losses`, `visualize_the_data` |

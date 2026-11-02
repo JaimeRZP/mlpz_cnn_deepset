@@ -1,3 +1,4 @@
+import glob
 import json
 import os
 import pickle
@@ -26,15 +27,20 @@ __all__ = [
     "save_ensemble_file",
     "load_ensemble_file",
     "train_ensembles",
+    "train_model",
     "train_from_catalog",
     "save_pretrained",
     "load_pretrained",
+    "pretrained_name",
+    "PRETRAINED_DIR",
     "DEFAULT_PRETRAINING",
 ]
 
-# Pre-trained ensembles shipped with the package, as <name>.json + <name>.npz (see save_pretrained)
+# Pre-trained ensembles shipped with the package, as <name>_<build_model>_<target>.json + .npz, one per
+# architecture and target (see pretrained_name and save_pretrained)
 PRETRAINED_DIR = os.path.join(os.path.dirname(__file__), "pretrained")
-# Used by train_ensembles unless pretraining=None: trained on the pop-cosmos mock, on the default grid
+# Used by train_ensembles unless pretraining=None: trained on the pop-cosmos mock, on the default grid; the variant
+# of the architecture and target being trained is used
 DEFAULT_PRETRAINING = "popcosmos"
 
 
@@ -189,6 +195,11 @@ def _as_ensemble_member(model, target, Y_mean, Y_std):
         return model, Y_mean, Y_std
     outputs = ToRedshift(Y_mean, Y_std)(model.outputs[0])
     return models.Model(model.inputs[0], outputs), 0.0, 1.0
+
+
+def _model_target(model):
+    """The target a trained model was trained with: log1pz models end in ToRedshift, z3 ones do not."""
+    return "log1pz" if isinstance(model.layers[-1], ToRedshift) else "z3"
 
 
 def _check_target_loss(target, loss):
@@ -439,7 +450,16 @@ def load_ensemble_file(path):
     return trained_models, payload["features"]
 
 
-def save_pretrained(path, trained_models, config, info=None):
+def pretrained_name(name, build_model_func, target):
+    """
+    The file name (no extension) of the pre-training called name of build_model_func's architecture trained with
+    target, e.g. popcosmos_build_model_res_se_log1pz: the pre-trainings shipped in PRETRAINED_DIR are named so,
+    and pretraining=name picks the one matching the build_model_func and target it trains with.
+    """
+    return f"{name}_{build_model_func.__name__}_{target}"
+
+
+def save_pretrained(path, trained_models, config, info=None, *, build_model_func):
     """
     Save an ensemble as a pre-training starting point: <path>.json (architecture, Y normalisations, feature
     config, provenance) and <path>.npz (weights). No pickle, so loading it cannot run code.
@@ -450,6 +470,11 @@ def save_pretrained(path, trained_models, config, info=None):
     config: the feature config the inputs were built with (see znn.catalog_to_XY). Users of the
         pre-training must build their inputs on the same grid.
     info: optional dict of provenance (training data, settings, versions), stored as is.
+    build_model_func: the function the members were built with. Its name is stored with the target the members
+        were trained with, and both are checked against those of any training started from this pre-training.
+
+    To ship a pre-training with znn, save it to os.path.join(PRETRAINED_DIR, pretrained_name(name,
+    build_model_func, target)).
     """
     architecture = trained_models[0][0].to_json()
     members = []
@@ -459,6 +484,8 @@ def save_pretrained(path, trained_models, config, info=None):
             member["architecture"] = model.to_json()
         members.append(member)
     meta = {
+        "build_model": build_model_func.__name__,
+        "target": _model_target(trained_models[0][0]),
         "architecture": architecture,
         "members": members,
         "config": {k: (list(v) if isinstance(v, tuple) else v) for k, v in config.items()},
@@ -470,17 +497,38 @@ def save_pretrained(path, trained_models, config, info=None):
     np.savez_compressed(f"{path}.npz", **weights)
 
 
-def load_pretrained(name=DEFAULT_PRETRAINING):
-    """
-    Load a pre-trained ensemble saved with save_pretrained.
+def _shipped_variants(name):
+    """(build_model, target) of every pre-training called name shipped in PRETRAINED_DIR (see pretrained_name)."""
+    variants = []
+    for path in sorted(glob.glob(os.path.join(PRETRAINED_DIR, f"{name}_*.json"))):
+        with open(path) as f:
+            meta = json.load(f)
+        if os.path.basename(path) == f"{name}_{meta['build_model']}_{meta['target']}.json":
+            variants.append((meta["build_model"], meta["target"]))
+    return variants
 
-    name: the name of an ensemble shipped with znn (e.g. "popcosmos"), or a path without extension to a
-        <path>.json / <path>.npz pair.
 
-    Returns (trained_models, config, info): the members as (model, Y_mean, Y_std) tuples, the feature config
-    their inputs were built with, and the provenance dict.
+def _pretrained_path(name, build_model_func, target):
     """
-    path = os.path.join(PRETRAINED_DIR, name) if os.path.exists(os.path.join(PRETRAINED_DIR, f"{name}.json")) else name
+    The <path>.json / <path>.npz pair to load for pretraining=name: the variant of a shipped pre-training matching
+    build_model_func and target, or name itself if no pre-training of that name is shipped (a path).
+    """
+    variants = _shipped_variants(name)
+    if not variants:
+        return name
+    if build_model_func is None:
+        raise ValueError(f"pass build_model_func to choose which '{name}' pre-training to use")
+    if (build_model_func.__name__, target) not in variants:
+        available = ", ".join(f"{b} with target='{t}'" for b, t in variants)
+        raise ValueError(
+            f"znn ships no '{name}' pre-training of {build_model_func.__name__} with target='{target}' (available: "
+            f"{available}); train one (see save_pretrained) or pass pretraining=None"
+        )
+    return os.path.join(PRETRAINED_DIR, pretrained_name(name, build_model_func, target))
+
+
+def _read_pretrained(path):
+    """The members saved with save_pretrained at path, as (model, Y_mean, Y_std) tuples, and the stored metadata."""
     with open(f"{path}.json") as f:
         meta = json.load(f)
     weights = np.load(f"{path}.npz")
@@ -490,19 +538,43 @@ def load_pretrained(name=DEFAULT_PRETRAINING):
         model = tf.keras.models.model_from_json(member.get("architecture", meta["architecture"]))
         model.set_weights([weights[f"m{k}_{i}"] for i in range(len(model.get_weights()))])
         trained_models.append((model, member["Y_mean"], member["Y_std"]))
+    return trained_models, meta
 
+
+def load_pretrained(name=DEFAULT_PRETRAINING, build_model_func=build_model, target="z3"):
+    """
+    Load a pre-trained ensemble saved with save_pretrained.
+
+    name: the name of a pre-training shipped with znn (e.g. "popcosmos"), of which the variant of
+        build_model_func's architecture trained with target is loaded (see pretrained_name); or a path without
+        extension to a <path>.json / <path>.npz pair, loaded as is.
+
+    Returns (trained_models, config, info): the members as (model, Y_mean, Y_std) tuples, the feature config
+    their inputs were built with, and the provenance dict.
+    """
+    trained_models, meta = _read_pretrained(_pretrained_path(name, build_model_func, target))
     config = {k: (tuple(v) if isinstance(v, list) else v) for k, v in meta["config"].items()}
     return trained_models, config, meta["info"]
 
 
-def _resolve_pretraining(pretraining):
-    """The pre-trained start as (model, Y_mean, Y_std): the first member of the given ensemble; None from scratch."""
+def _resolve_pretraining(pretraining, build_model_func, target):
+    """
+    The pre-trained start as (model, Y_mean, Y_std): the first member of the given ensemble; None from scratch. A
+    shipped pre-training is the variant of build_model_func's architecture and target; one given by path must have
+    been saved with the same build_model_func. The target of any start is checked by _check_target.
+    """
     if pretraining is None:
         return None
     if isinstance(pretraining, str):
         if pretraining.endswith(".pkl"):
             return load_ensemble_file(pretraining)[0][0]
-        return load_pretrained(pretraining)[0][0]
+        trained_models, meta = _read_pretrained(_pretrained_path(pretraining, build_model_func, target))
+        if build_model_func is not None and meta.get("build_model", build_model_func.__name__) != build_model_func.__name__:
+            raise ValueError(
+                f"the pre-training '{pretraining}' is a {meta['build_model']}, not a {build_model_func.__name__}; "
+                "use a pre-training of this architecture, or pass pretraining=None"
+            )
+        return trained_models[0]
     return list(pretraining)[0]
 
 
@@ -519,6 +591,21 @@ def _check_inputs(start, input_shape):
         raise ValueError(
             f"inputs have shape {tuple(input_shape)} but the pre-trained model expects {expected}; build them "
             "with the same feature config as the pre-training, or pass pretraining=None"
+        )
+
+
+def _check_target(start, target):
+    """
+    Raise if the pre-trained start (model, Y_mean, Y_std) was trained with another target than target; None is from
+    scratch. A log1pz model ends in ToRedshift, a z3 one does not.
+    """
+    if start is None:
+        return
+    start_target = _model_target(start[0])
+    if start_target != target:
+        raise ValueError(
+            f"the pre-trained model was trained with target='{start_target}', not '{target}'; pass the same target, "
+            "use a pre-training with this target, or pass pretraining=None"
         )
 
 
@@ -550,9 +637,11 @@ def _train_member(
     N_FROZEN_LAYERS layers frozen and its Y normalisation kept. With monitor False, X[idx_val] only goes in the
     history: the member trains for all EPOCHS at a constant LEARNING_RATE. Returns ((model, Y_mean, Y_std), history).
 
-    target and loss are as for train_ensembles. target only applies from scratch: from a start, the start's
-    (linear) Y normalisation is kept, whatever target.
+    target and loss are as for train_ensembles; a start must have been trained with the same target. A log1pz
+    start is trained without its ToRedshift layer, in the standardised log(1 + z) that layer holds, and gets it
+    back afterwards.
     """
+    _check_target(start, target)
     # Clear session before each member
     tf.keras.backend.clear_session()
 
@@ -569,20 +658,23 @@ def _train_member(
         if target == "z3":
             Y_mean = 0
             Y_std = 3
-            T_train, T_val = Y_train, Y_val
         else:  # "log1pz": standardised with this member's training redshifts
-            T_train, T_val = np.log1p(Y_train), np.log1p(Y_val)
-            Y_mean, Y_std = float(T_train.mean()), float(T_train.std())
+            Y_mean, Y_std = float(np.log1p(Y_train).mean()), float(np.log1p(Y_train).std())
     else:
         # Copy the start (so it is left untouched), freeze its early layers, and keep the Y normalisation its
         # output layer learned
         start_model, Y_mean, Y_std = start
         model = tf.keras.models.clone_model(start_model)
         model.set_weights(start_model.get_weights())
+        if target == "log1pz":
+            # train the network under ToRedshift, in the standardised log(1 + z) it was pre-trained in
+            to_z = model.layers[-1]
+            Y_mean, Y_std = to_z.mean, to_z.std
+            model = models.Model(model.inputs[0], to_z.input)
         for layer in model.layers[:N_FROZEN_LAYERS]:
             layer.trainable = False
-        target = "z3"  # the start's normalisation is linear in z
-        T_train, T_val = Y_train, Y_val
+
+    T_train, T_val = (Y_train, Y_val) if target == "z3" else (np.log1p(Y_train), np.log1p(Y_val))
 
     # Normalise Y
     Y_train_norm = (T_train - Y_mean) / Y_std
@@ -635,35 +727,41 @@ def train_ensembles(
 
     pretraining: the one model every member starts from.
       - "popcosmos" (default): the model shipped with znn, trained on the pop-cosmos mock (see
-        load_pretrained). Its inputs were built with the default feature config, so X must be too (in
-        particular the default lambda_range and n_bins).
+        load_pretrained), of the architecture of build_model_func trained with target: the file
+        PRETRAINED_DIR/popcosmos_<build_model_func>_<target> (see pretrained_name). An error lists the variants
+        shipped if there is none for these options. Its inputs were built with the default feature config, so X
+        must be too (in particular the default lambda_range and n_bins).
       - None: every member from scratch, built with build_model_func.
-      - your own: the name or path of a save_pretrained pair, the path of a save_ensemble_file .pkl, or a
-        list of (model, Y_mean, Y_std) as returned by train_ensembles; of an ensemble, the first member is
-        used. Its inputs must be on the same grid as X.
+      - your own: the path of a save_pretrained pair, the path of a save_ensemble_file .pkl, or a list of
+        (model, Y_mean, Y_std) as returned by train_ensembles; of an ensemble, the first member is used. Its
+        inputs must be on the same grid as X, and it must have been trained with target; a save_pretrained pair
+        must also have been saved with build_model_func.
       With pre-training, every member starts from a copy of that model, with its first N_FROZEN_LAYERS
       layers frozen and its Y normalisation kept; everything else (optimizer, learning rate, epochs,
-      callbacks, split) is as from scratch, and build_model_func is not used. The pre-trained model is not
-      modified.
+      callbacks, split) is as from scratch, and build_model_func only selects and checks the pre-training. The
+      pre-trained model is not modified.
 
-    target: how the redshift is scaled for training from scratch (see TARGETS). With pre-training, the
-      pre-trained model's normalisation is kept and target is ignored.
+    target: how the redshift is scaled for training (see TARGETS).
       - "z3" (default): z / 3, the original scheme.
       - "log1pz": log(1 + z), standardised with each member's training mean and std. A ToRedshift layer is
         appended to each trained model so it outputs z, and the member is (model, 0, 1).
+      With pre-training, the pre-trained model must have been trained with the same target (an error is raised
+      otherwise), and its Y normalisation is kept: a log1pz model is fine-tuned in the standardised log(1 + z)
+      its ToRedshift layer holds.
     loss: "mse" (default) or "huber" (see LOSSES).
     huber_delta: the Huber delta in dz / (1 + z); only used with loss="huber".
 
-    The new architectures (build_model_res_se, build_model_v2_k7) need pretraining=None, since the shipped
-    pre-training is a build_model. The best setups from the architecture tests were build_model_res_se and
+    The new architectures (build_model_res_se, build_model_v2_k7) need pretraining=None or a pre-training of
+    their own, since the shipped pre-training is a build_model (trained with target="z3"). The best setups from the architecture tests were build_model_res_se and
     build_model_v2_k7 with target="log1pz", and build_model_res_se with target="log1pz", loss="huber".
 
     Returns (trained_models, histories): the members as (model, Y_mean, Y_std) and their Keras histories.
     """
     _check_target_loss(target, loss)
-    start = _resolve_pretraining(pretraining)
+    start = _resolve_pretraining(pretraining, build_model_func, target)
     X_members = _inputs_per_member(X, N_SPLITS)
     _check_inputs(start, X_members[0].shape[1:])
+    _check_target(start, target)
 
     trained_models = []
     histories = []
@@ -677,6 +775,41 @@ def train_ensembles(
         histories.append(history)
 
     return trained_models, histories
+
+
+def train_model(
+    build_model_func,
+    X,
+    Y,
+    VAL_FRAC=0.2,
+    EPOCHS=100,
+    BATCH_SIZE=256,
+    random_state=42,
+    pretraining=DEFAULT_PRETRAINING,
+    LEARNING_RATE=1e-3,
+    target="z3",
+    loss="mse",
+    huber_delta=0.05,
+):
+    """
+    Train a single model from prebuilt inputs, e.g. a pre-training (see save_pretrained).
+
+    A random VAL_FRAC of the objects (by random_state) is held out for early stopping and learning-rate reduction,
+    and the model trains on the rest, as the base model of train_from_catalog(from_base=True). Everything else
+    (pretraining, LEARNING_RATE, target, loss, huber_delta) is as for train_ensembles.
+
+    Returns ((model, Y_mean, Y_std), history): a one-member ensemble is [(model, Y_mean, Y_std)].
+    """
+    _check_target_loss(target, loss)
+    start = _resolve_pretraining(pretraining, build_model_func, target)
+    _check_inputs(start, X.shape[1:])
+    _check_target(start, target)
+
+    idx_train, idx_val = train_test_split(np.arange(len(Y)), test_size=VAL_FRAC, random_state=random_state)
+    return _train_member(
+        build_model_func, X, Y, idx_train, idx_val, start, EPOCHS, BATCH_SIZE, LEARNING_RATE,
+        target=target, loss=loss, huber_delta=huber_delta,
+    )
 
 
 def train_from_catalog(
@@ -712,8 +845,8 @@ def train_from_catalog(
     the photometry as given and the members differ only by data cut (and the randomness of training).
 
     The objects are split K-fold, K = N_MEMBERS, as in train_ensembles. pretraining, random_state, target,
-    loss and huber_delta are as for train_ensembles. With from_base, target applies to the base model (from
-    scratch); the members are fine-tuned from it in its normalisation (z itself, for a log1pz base).
+    loss and huber_delta are as for train_ensembles. With from_base, the base model and the members fine-tuned
+    from it are all trained with target.
 
     from_base: train in two stages, cheaper per member:
       1. a base model, from `pretraining`, on all the objects and the photometry as given (a random VAL_FRAC
@@ -745,8 +878,9 @@ def train_from_catalog(
         return catalog_to_XY(photometry, bands, ref_band, config, filter_curves=filter_curves)[0]
 
     X_given = inputs(df)
-    start = _resolve_pretraining(pretraining)
+    start = _resolve_pretraining(pretraining, build_model_func, target)
     _check_inputs(start, X_given.shape[1:])
+    _check_target(start, target)
 
     base_history = None
     epochs, learning_rate, monitor = EPOCHS, 1e-3, True
