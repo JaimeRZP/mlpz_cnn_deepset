@@ -15,7 +15,7 @@ Examples (from the repo root):
     python run_challenge.py                              # task sets 1-4, then the results
     python run_challenge.py --tasksets 3 4               # task sets 3 and 4, then the results
     python run_challenge.py --no-train                   # only the results notebook
-    python run_challenge.py --set ERRORS=None --set 'RUN="clean_kfold_frombase"'
+    python run_challenge.py --set PRETRAINING=None        # every task set from scratch
 
 On NERSC, so it survives logging out:
     nohup python run_challenge.py > run_challenge.log 2>&1 &
