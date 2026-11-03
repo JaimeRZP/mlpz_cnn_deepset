@@ -9,7 +9,7 @@ from tensorflow.keras import callbacks, layers, models
 
 from .data import DEFAULT_FEATURE_CONFIG, catalog_to_XY, resample_photometry
 from .io import load_filter_curves
-from .qp_output import package_predictions
+from .qp_output import package_pdfs, package_predictions
 
 __all__ = [
     "build_model",
@@ -24,6 +24,8 @@ __all__ = [
     "train_ensembles",
     "train_model",
     "train_from_catalog",
+    "train_variance_model",
+    "moment_predict_resampled",
     "PRETRAINED_DIR",
     "DEFAULT_PRETRAINING",
 ]
@@ -477,3 +479,86 @@ def train_from_catalog(
         histories.append(history)
 
     return trained_models, histories, base_history
+
+
+# --- Moment networks (Jeffrey & Wandelt 2020, arXiv:2011.05991) ---
+# A trained model F predicts the mean of the standardised log(1 + z); a second network G, trained on F's squared
+# residuals with F fixed, predicts their variance. The pair is stored as a two-member list [(F, 0, 1), (G, 0, s**2)],
+# with s the standardisation of F's ToRedshift layer, so G.predict(X) * s**2 is the variance of log(1 + z), and
+# save_ensemble_file / load_ensemble_file store it as any ensemble.
+DEFAULT_ZGRID = np.linspace(0, 3, 301)  # where moment_predict_resampled evaluates p(z)
+
+
+def train_variance_model(
+    build_model_func, X, Y, mean_member, VAL_FRAC=0.2, EPOCHS=100, BATCH_SIZE=256, random_state=42
+):
+    """
+    Train a second network G on the squared residuals of a trained model F, kept fixed (eq. 5 of Jeffrey & Wandelt
+    2020): G learns the variance of F's prediction, in the standardised log(1 + z) F is trained in. G is a new
+    instance of build_model_func, trained from scratch with MSE, holding out a random VAL_FRAC for early stopping.
+
+    mean_member: F, as (model, 0, 1) from train_model (or any member: its model ends in ToRedshift).
+
+    Returns (moment_model, history), moment_model = [mean_member, (G, 0, s**2)] (see moment_predict_resampled).
+    """
+    model = mean_member[0]
+    to_z = model.layers[-1]
+    T_pred = models.Model(model.inputs[0], to_z.input).predict(X, batch_size=4096, verbose=0).ravel()
+    R2 = ((np.log1p(Y) - to_z.mean) / to_z.std - T_pred) ** 2  # F's squared residuals, in its training units
+    idx_train, idx_val = train_test_split(np.arange(len(Y)), test_size=VAL_FRAC, random_state=random_state)
+
+    # ── Callbacks ─────────────────────────────────────────────────────────────────
+    early_stop = callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
+    reduce_lr = callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1)
+
+    var_model = build_model_func(input_shape=X.shape[1:])
+    var_model.compile(optimizer="adam", loss="mse")
+    history = var_model.fit(
+        X[idx_train],
+        R2[idx_train],
+        validation_data=(X[idx_val], R2[idx_val]),
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        callbacks=[early_stop, reduce_lr],
+        verbose=2,
+    )
+    return [mean_member, (var_model, 0.0, to_z.std**2)], history
+
+
+def moment_predict_resampled(
+    moment_model,
+    df,
+    errors,
+    n_samples,
+    rng,
+    bands,
+    ref_band,
+    config=DEFAULT_FEATURE_CONFIG,
+    filter_curves=None,
+    ids=None,
+    zgrid=DEFAULT_ZGRID,
+    min_std=1e-3,
+):
+    """
+    Predict p(z) with a moment network, with the photometric errors propagated by Monte Carlo.
+
+    For each of n_samples noise realizations of the catalogue's photometry (see resample_photometry), F and G give
+    a Gaussian in log(1 + z), with F's mean and G's variance (floored at min_std**2). The p(z) is the equal-weight
+    mixture of the n_samples Gaussians, converted to z (Jacobian 1 / (1 + z)) and evaluated on zgrid.
+
+    moment_model: [(F, 0, 1), (G, 0, s**2)], as returned by train_variance_model.
+    Other arguments as for ensemble_predict_resampled.
+
+    Returns the p(z) on zgrid, as a qp interp Ensemble (or the fallback DataFrame, see package_pdfs).
+    """
+    (mean_model, _, _), (var_model, var_mean, var_scale) = moment_model
+    log_grid = np.log1p(zgrid)
+    pdfs = np.zeros((len(df), len(zgrid)))
+    for _ in range(n_samples):
+        X, _ = catalog_to_XY(resample_photometry(df, errors, rng), bands, ref_band, config, filter_curves=filter_curves)
+        mu = np.log1p(mean_model.predict(X, batch_size=4096, verbose=0).ravel())
+        var = var_model.predict(X, batch_size=4096, verbose=0).ravel() * var_scale + var_mean
+        sigma = np.sqrt(np.maximum(var, min_std**2))
+        pdfs += np.exp(-0.5 * ((log_grid - mu[:, None]) / sigma[:, None]) ** 2) / (np.sqrt(2 * np.pi) * sigma[:, None])
+    pdfs /= n_samples * (1 + zgrid)
+    return package_pdfs(zgrid, pdfs, ids=ids)
