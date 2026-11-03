@@ -12,7 +12,7 @@ from .io import load_filter_curves
 from .qp_output import package_predictions
 
 __all__ = [
-    "build_model_res_se",
+    "build_model",
     "ToRedshift",
     "ensemble_predict",
     "ensemble_predict_resampled",
@@ -28,7 +28,7 @@ __all__ = [
     "DEFAULT_PRETRAINING",
 ]
 
-# Pre-trained models shipped with znn, as <name>.keras: "popcosmos" is build_model_res_se trained on the pop-cosmos
+# Pre-trained models shipped with znn, as <name>.keras: "popcosmos" is build_model trained on the pop-cosmos
 # mock, on the default feature grid (see README)
 PRETRAINED_DIR = os.path.join(os.path.dirname(__file__), "pretrained")
 DEFAULT_PRETRAINING = "popcosmos"
@@ -64,7 +64,7 @@ def _residual_se_block(x, width, kernel_size=3):
     return layers.Activation("relu")(y)
 
 
-def build_model_res_se(input_shape):
+def build_model(input_shape):
     # The model: residual squeeze-excitation net with a kernel-7 stem (conv, batch norm, ReLU), 3 stages
     # (32/64/128 filters) of 2 blocks each, pooling after the first two stages (32 -> 16 -> 8 positions), then a
     # dense head. ~270k parameters. Trained on log(1 + z) (see train_ensembles)

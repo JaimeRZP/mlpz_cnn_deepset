@@ -40,7 +40,7 @@ test = znn.read_catalog("test.hdf5")
 
 # Features and training, starting from the pop-cosmos pre-trained weights (pretraining=None: from scratch)
 X, z = znn.catalog_to_XY(train, BANDS, REF_BAND)
-models, histories = znn.train_ensembles(znn.build_model_res_se, X, z, N_SPLITS=5)
+models, histories = znn.train_ensembles(znn.build_model, X, z, N_SPLITS=5)
 
 # p(z) from the spread of the ensemble members
 X_test, _ = znn.catalog_to_XY(test, BANDS, REF_BAND)
@@ -56,7 +56,7 @@ pz.write_to("pz_estimate.hdf5")
 # Or train from the catalogue, each member fine-tuned on its own K-fold cut from a base model trained on
 # all the objects
 models, histories, base_history = znn.train_from_catalog(
-    znn.build_model_res_se, train, train["redshift"].to_numpy(), BANDS, REF_BAND, N_MEMBERS=10, from_base=True
+    znn.build_model, train, train["redshift"].to_numpy(), BANDS, REF_BAND, N_MEMBERS=10, from_base=True
 )
 
 # Save the ensemble with everything needed to rebuild its inputs, then reload it
@@ -84,7 +84,7 @@ X_test, _ = znn.catalog_to_XY(test, **features)
 2. **An ensemble of CNNs** (`train_ensembles`)
    - The training set is split K ways (`N_SPLITS`), and one model is trained per fold, using the
      other folds as its validation set.
-   - The model is `build_model_res_se`, a residual net with squeeze-excitation (273k parameters: a
+   - The model is `build_model`, a residual net with squeeze-excitation (273k parameters: a
      kernel-7 stem, 3 stages of 2 blocks, global average pooling and a dense head).
    - Each member predicts a single redshift, trained with an MSE loss on log(1 + z), standardised with
      the training mean and std. A `ToRedshift` layer appended to the trained model maps its output back to z.
@@ -116,7 +116,7 @@ X_test, _ = znn.catalog_to_XY(test, **features)
 |---|---|---|
 | `znn/io.py` | Reading catalogues and filter curves | `read_catalog`, `load_filter_curves`, `catalog_to_mags` |
 | `znn/data.py` | Building CNN inputs and resampling photometry | `catalog_to_XY`, `resample_photometry`, `DEFAULT_FEATURE_CONFIG` |
-| `znn/models.py` | The model, training, prediction, saving and loading | `build_model_res_se`, `train_ensembles`, `train_from_catalog`, `train_model`, `load_pretrained`, `ensemble_predict`, `ensemble_predict_resampled`, `save_ensemble_file`, `load_ensemble_file` |
+| `znn/models.py` | The model, training, prediction, saving and loading | `build_model`, `train_ensembles`, `train_from_catalog`, `train_model`, `load_pretrained`, `ensemble_predict`, `ensemble_predict_resampled`, `save_ensemble_file`, `load_ensemble_file` |
 | `znn/qp_output.py` | Packaging predictions as p(z) | `package_predictions`, `save_predictions` |
 | `znn/stats.py` | Robust point-estimate statistics | `get_biweight_mean_sigma_outlier`, `get_all_stats`, `stats_to_markdown` |
 | `znn/plotting.py` | Diagnostic plots | `plot_stats`, `compare_binned_stats`, `plot_ensemble_losses`, `visualize_the_data` |
