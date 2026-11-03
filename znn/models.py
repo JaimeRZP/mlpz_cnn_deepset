@@ -4,7 +4,7 @@ import pickle
 
 import numpy as np
 import tensorflow as tf
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, train_test_split
 from tensorflow.keras import callbacks, layers, models
 
 from .data import DEFAULT_FEATURE_CONFIG, catalog_to_XY, resample_photometry
@@ -13,61 +13,95 @@ from .qp_output import package_predictions
 
 __all__ = [
     "build_model",
-    "build_model_v2",
+    "ToRedshift",
     "ensemble_predict",
     "ensemble_predict_resampled",
     "save_ensemble",
     "load_ensemble",
     "save_ensemble_file",
     "load_ensemble_file",
+    "load_pretrained",
     "train_ensembles",
-    "fine_tune_pre_trained_model",
+    "train_model",
+    "train_from_catalog",
+    "PRETRAINED_DIR",
+    "DEFAULT_PRETRAINING",
 ]
+
+# Pre-trained models shipped with znn, as <name>.keras: "popcosmos" is build_model trained on the pop-cosmos
+# mock, on the default feature grid (see README)
+PRETRAINED_DIR = os.path.join(os.path.dirname(__file__), "pretrained")
+DEFAULT_PRETRAINING = "popcosmos"
+# Layers kept fixed when the members are fine-tuned from a base model: the stem (input, conv, batch norm, ReLU)
+N_FROZEN_LAYERS = 4
+
+
+def _squeeze_excite(x, ratio=4):
+    """Channel attention: reweight each channel by a gate computed from its average over wavelength."""
+    channels = x.shape[-1]
+    s = layers.GlobalAveragePooling1D()(x)
+    s = layers.Dense(max(channels // ratio, 4), activation="relu")(s)
+    s = layers.Dense(channels, activation="sigmoid")(s)
+    s = layers.Reshape((1, channels))(s)
+    return layers.Multiply()([x, s])
+
+
+def _residual_se_block(x, width, kernel_size=3):
+    """Two conv-BN layers and a squeeze-excitation gate, added to an identity skip (1x1 conv if the width changes)."""
+    shortcut = x
+    if x.shape[-1] != width:
+        shortcut = layers.Conv1D(width, kernel_size=1, use_bias=False)(x)
+        shortcut = layers.BatchNormalization()(shortcut)
+
+    y = layers.Conv1D(width, kernel_size=kernel_size, padding="same", use_bias=False)(x)
+    y = layers.BatchNormalization()(y)
+    y = layers.Activation("relu")(y)
+    y = layers.Conv1D(width, kernel_size=kernel_size, padding="same", use_bias=False)(y)
+    y = layers.BatchNormalization()(y)
+    y = _squeeze_excite(y)
+
+    y = layers.Add()([shortcut, y])
+    return layers.Activation("relu")(y)
 
 
 def build_model(input_shape):
-    # 6 layers
-    model = models.Sequential(
-        [
-            layers.Conv1D(32, kernel_size=3, activation="relu", padding="same", input_shape=input_shape),
-            layers.MaxPooling1D(),
-            layers.Conv1D(64, kernel_size=3, activation="relu", padding="same"),
-            layers.MaxPooling1D(),
-            layers.Conv1D(128, kernel_size=3, activation="relu", padding="same"),
-            layers.MaxPooling1D(),
-            layers.Conv1D(256, kernel_size=3, activation="relu", padding="same"),
-            # layers.MaxPooling1D(),
-            layers.Conv1D(512, kernel_size=3, activation="relu", padding="same"),
-            layers.Conv1D(512, kernel_size=3, activation="relu", padding="same"),
-            layers.GlobalAveragePooling1D(),
-            layers.Dense(64, activation="relu"),
-            layers.Dropout(0.3),
-            layers.Dense(1),
-        ]
-    )
-    return model
+    # The model: residual squeeze-excitation net with a kernel-7 stem (conv, batch norm, ReLU), 3 stages
+    # (32/64/128 filters) of 2 blocks each, pooling after the first two stages (32 -> 16 -> 8 positions), then a
+    # dense head. ~270k parameters. Trained on log(1 + z) (see train_ensembles)
+    inputs = layers.Input(shape=input_shape)
+    x = layers.Conv1D(32, kernel_size=7, padding="same", use_bias=False)(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+
+    for stage, width in enumerate([32, 64, 128]):
+        x = _residual_se_block(x, width)
+        x = _residual_se_block(x, width)
+        if stage < 2:
+            x = layers.MaxPooling1D()(x)
+
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dense(64, activation="relu")(x)
+    x = layers.Dropout(0.3)(x)
+    outputs = layers.Dense(1)(x)
+    return models.Model(inputs, outputs)
 
 
-def build_model_v2(input_shape):
-    # 5 layers
-    model = models.Sequential(
-        [
-            layers.Conv1D(32, kernel_size=3, activation="relu", padding="same", input_shape=input_shape),
-            layers.MaxPooling1D(),
-            layers.Conv1D(64, kernel_size=3, activation="relu", padding="same"),
-            layers.MaxPooling1D(),
-            layers.Conv1D(128, kernel_size=3, activation="relu", padding="same"),
-            layers.MaxPooling1D(),
-            layers.Conv1D(256, kernel_size=3, activation="relu", padding="same"),
-            layers.MaxPooling1D(),
-            layers.Conv1D(512, kernel_size=3, activation="relu", padding="same"),
-            layers.GlobalAveragePooling1D(),
-            layers.Dense(64, activation="relu"),
-            layers.Dropout(0.3),
-            layers.Dense(1),
-        ]
-    )
-    return model
+@tf.keras.utils.register_keras_serializable(package="znn")
+class ToRedshift(layers.Layer):
+    """Map a standardised log(1 + z) output back to redshift: z = exp(y * std + mean) - 1."""
+
+    def __init__(self, mean, std, **kwargs):
+        super().__init__(**kwargs)
+        self.mean = float(mean)
+        self.std = float(std)
+
+    def call(self, y):
+        return tf.math.expm1(y * self.std + self.mean)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"mean": self.mean, "std": self.std})
+        return config
 
 
 def _inputs_per_member(X, n_members):
@@ -272,129 +306,174 @@ def load_ensemble_file(path):
     return trained_models, payload["features"]
 
 
-def train_ensembles(build_model_func, X, Y, N_SPLITS=10, EPOCHS=100, BATCH_SIZE=256, random_state=42):
+def load_pretrained(name=DEFAULT_PRETRAINING):
     """
-    Train one model per K-fold split, each predicting a point redshift trained with MSE.
+    A pre-trained model as an ensemble member (model, 0, 1): one shipped with znn (name, e.g. "popcosmos", in
+    PRETRAINED_DIR) or the path of a .keras file. Inputs must be built with the feature config it was trained with,
+    the default one for "popcosmos".
+    """
+    path = name if name.endswith(".keras") else os.path.join(PRETRAINED_DIR, f"{name}.keras")
+    return tf.keras.models.load_model(path), 0.0, 1.0
+
+
+def _start(pretraining):
+    """The member training starts from: None (from scratch), load_pretrained(pretraining), or an ensemble's first."""
+    if isinstance(pretraining, str):
+        return load_pretrained(pretraining)
+    return None if pretraining is None else pretraining[0]
+
+
+def _train_member(
+    build_model_func,
+    X,
+    Y,
+    idx_train,
+    idx_val,
+    start,
+    EPOCHS,
+    BATCH_SIZE,
+    learning_rate=1e-3,
+    monitor=True,
+    freeze_stem=False,
+):
+    """
+    Train one member on X[idx_train] and return ((model, 0, 1), history).
+
+    The target is log(1 + z), standardised with the training redshifts; a ToRedshift layer appended to the trained
+    model maps its output back to z. From start = (model, 0, 1), the network under start's ToRedshift layer is
+    copied, keeps that layer's normalisation and trains with every layer trainable, but, with freeze_stem, its
+    first N_FROZEN_LAYERS. X[idx_val] is used for early stopping and learning-rate reduction, or, with monitor
+    False, only goes in the history (all EPOCHS at a constant learning_rate).
+    """
+    tf.keras.backend.clear_session()
+
+    X_train, X_val = X[idx_train], X[idx_val]
+    T_train, T_val = np.log1p(Y[idx_train]), np.log1p(Y[idx_val])
+
+    if start is None:
+        model = build_model_func(input_shape=X_train.shape[1:])
+        Y_mean, Y_std = T_train.mean(), T_train.std()
+    else:
+        start_model = tf.keras.models.clone_model(start[0])  # a copy, so start is left untouched
+        start_model.set_weights(start[0].get_weights())
+        to_z = start_model.layers[-1]
+        Y_mean, Y_std = to_z.mean, to_z.std
+        model = models.Model(start_model.inputs[0], to_z.input)
+        for k, layer in enumerate(model.layers):
+            layer.trainable = not (freeze_stem and k < N_FROZEN_LAYERS)
+
+    # ── Callbacks ─────────────────────────────────────────────────────────────────
+    early_stop = callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
+    reduce_lr = callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1)
+
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate), loss="mse")
+    history = model.fit(
+        X_train,
+        (T_train - Y_mean) / Y_std,
+        validation_data=(X_val, (T_val - Y_mean) / Y_std),
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        callbacks=[early_stop, reduce_lr] if monitor else [],
+        verbose=2,
+    )
+    model = models.Model(model.inputs[0], ToRedshift(Y_mean, Y_std)(model.outputs[0]))
+    return (model, 0.0, 1.0), history
+
+
+def train_ensembles(
+    build_model_func, X, Y, N_SPLITS=10, EPOCHS=100, BATCH_SIZE=256, random_state=42, pretraining=DEFAULT_PRETRAINING
+):
+    """
+    Train one model per K-fold split, each predicting a point redshift trained with MSE on log(1 + z).
 
     X is either one feature array shared by all members, or a list of N_SPLITS arrays (same objects, in
     the same order as Y), one per member, e.g. a different photometric noise realization for each.
+
+    pretraining: what every member starts from: "popcosmos" (default, shipped with znn; X must be built with the
+    default feature config), the path of a .keras file (see load_pretrained), an ensemble (its first member), or
+    None (from scratch). Nothing is frozen: the pre-training only sets the starting weights.
+
+    Each member is (model, 0, 1): the model ends in a ToRedshift layer and outputs z.
     """
+    start = _start(pretraining)
     X_members = _inputs_per_member(X, N_SPLITS)
     kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=random_state)
 
     trained_models = []
     histories = []
-
     for fold, (idx_train, idx_val) in enumerate(kf.split(np.arange(len(Y)))):
         print(f"\n--- Fold {fold+1}/{N_SPLITS} ---")
-        X = X_members[fold]
-
-        # Clear session before each fold
-        tf.keras.backend.clear_session()
-
-        # ── Callbacks ─────────────────────────────────────────────────────────────────
-        early_stop = callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
-        reduce_lr = callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1)
-
-        # Split data using fold indices
-        X_train, X_val = X[idx_train], X[idx_val]
-        Y_train, Y_val = Y[idx_train], Y[idx_val]
-
-        # Normalise Y using train statistics only
-        # Y_mean, Y_std = Y_train.mean(), Y_train.std()
-        Y_mean = 0
-        Y_std = 3
-        Y_train_norm = (Y_train - Y_mean) / Y_std
-        Y_val_norm = (Y_val - Y_mean) / Y_std
-
-        # Build fresh model for each fold
-        model = build_model_func(input_shape=X_train.shape[1:])
-        model.compile(optimizer="adam", loss="mse")
-
-        # Train
-        history = model.fit(
-            X_train,
-            Y_train_norm,
-            validation_data=(X_val, Y_val_norm),
-            epochs=EPOCHS,
-            batch_size=BATCH_SIZE,
-            callbacks=[early_stop, reduce_lr],
-            verbose=2,
+        trained, history = _train_member(
+            build_model_func, X_members[fold], Y, idx_train, idx_val, start, EPOCHS, BATCH_SIZE
         )
-
-        trained_models.append((model, Y_mean, Y_std))  # save model + its normalisation
+        trained_models.append(trained)
         histories.append(history)
 
     return trained_models, histories
 
 
-def fine_tune_pre_trained_model(X_fortrain, Y_fortrain, pretrained_models=None, model_root="", nlayers_forzen=4):
-    # need to provide either the model or the model_dir to load the model
-    # will always load model if both are provided
+def train_model(
+    build_model_func, X, Y, VAL_FRAC=0.2, EPOCHS=100, BATCH_SIZE=256, random_state=42, pretraining=DEFAULT_PRETRAINING
+):
+    """
+    Train a single model, e.g. a pre-training, holding out a random VAL_FRAC of the objects for early stopping.
+    pretraining as for train_ensembles. Returns ((model, 0, 1), history).
+    """
+    idx_train, idx_val = train_test_split(np.arange(len(Y)), test_size=VAL_FRAC, random_state=random_state)
+    return _train_member(build_model_func, X, Y, idx_train, idx_val, _start(pretraining), EPOCHS, BATCH_SIZE)
 
-    # Each member keeps the Y normalisation it was pre-trained with, so its output layer stays on the
-    # scale it learned
-    if model_root != "":
-        with open(os.path.join(model_root, "norm_params.json"), "r") as f:
-            pretrained_norms = [(p["Y_mean"], p["Y_std"]) for p in json.load(f)]
-    elif pretrained_models is not None:
-        pretrained_norms = [(Y_mean, Y_std) for _, Y_mean, Y_std in pretrained_models]
-    else:
-        raise ValueError("provide either pretrained_models or model_root")
 
-    # one fold per pre-trained member
-    n_splits = len(pretrained_norms)
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+def train_from_catalog(
+    build_model_func,
+    df,
+    Y,
+    bands,
+    ref_band,
+    config=DEFAULT_FEATURE_CONFIG,
+    filter_curves=None,
+    N_MEMBERS=5,
+    from_base=False,
+    EPOCHS=100,
+    FINETUNE_EPOCHS=10,
+    FINETUNE_LR=3e-4,
+    BATCH_SIZE=256,
+    random_state=42,
+    pretraining=DEFAULT_PRETRAINING,
+    VAL_FRAC=0.2,
+):
+    """
+    Train an ensemble of N_MEMBERS models on a catalogue, as train_ensembles: member k on its own K-fold cut,
+    on the photometry as given (the photometric errors are not used in training).
 
+    from_base: first train a base model from `pretraining` on all the objects (a random VAL_FRAC held out for
+    early stopping), then fine-tune a copy of it per member for FINETUNE_EPOCHS at a constant FINETUNE_LR, with
+    its stem (first N_FROZEN_LAYERS layers) frozen, the same in every member. The base has seen every member's
+    validation fold, so the fine-tuning has no early stopping.
+
+    df: the training catalogue (see znn.io.read_catalog), with Y its reference redshifts in the same order.
+    bands, ref_band, config, filter_curves: feature settings, as for catalog_to_XY.
+
+    Returns (trained_models, histories, base_history), base_history None without from_base.
+    """
+    X, _ = catalog_to_XY(df, bands, ref_band, config, filter_curves=filter_curves)
+    start = _start(pretraining)
+    base_history = None
+    epochs, learning_rate, monitor = EPOCHS, 1e-3, True
+    if from_base:
+        print("\n=== Base model, on all objects ===")
+        idx_train, idx_val = train_test_split(np.arange(len(Y)), test_size=VAL_FRAC, random_state=random_state)
+        start, base_history = _train_member(build_model_func, X, Y, idx_train, idx_val, start, EPOCHS, BATCH_SIZE)
+        epochs, learning_rate, monitor = FINETUNE_EPOCHS, FINETUNE_LR, False
+
+    kf = KFold(n_splits=N_MEMBERS, shuffle=True, random_state=random_state)
     trained_models = []
     histories = []
-
-    for fold, (idx_train, idx_val) in enumerate(kf.split(X_fortrain)):
-        print(f"\n--- Fold {fold+1}/{n_splits} ---")
-        tf.keras.backend.clear_session()
-
-        # ── Callbacks ─────────────────────────────────────────────────────────────────
-        early_stop = callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
-        reduce_lr = callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1)
-
-        # Split data using fold indices
-        X_train, X_val = X_fortrain[idx_train], X_fortrain[idx_val]
-        Y_train, Y_val = Y_fortrain[idx_train], Y_fortrain[idx_val]
-
-        if model_root != "":
-            model = tf.keras.models.load_model(os.path.join(model_root, f"model_fold_{fold+1}.keras"))
-        else:
-            model = pretrained_models[fold][0]
-
-        # Step 2: optionally freeze early layers (keep low-level features fixed)
-        for layer in model.layers[:nlayers_forzen]:  # freeze first 4 layers
-            layer.trainable = False
-
-        # same normalization as the pre-training
-        Y_mean, Y_std = pretrained_norms[fold]
-        Y_train_norm = (Y_train - Y_mean) / Y_std
-        Y_val_norm = (Y_val - Y_mean) / Y_std
-
-        # Step 3: recompile with a LOWER learning rate — important
-        # too high a learning rate will destroy what the model already learned
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),  # much lower than default 1e-3
-            loss="mse",
-            metrics=["mae"],
+    for member, (idx_train, idx_val) in enumerate(kf.split(np.arange(len(Y)))):
+        print(f"\n--- Member {member+1}/{N_MEMBERS} ---")
+        trained, history = _train_member(
+            build_model_func, X, Y, idx_train, idx_val, start, epochs, BATCH_SIZE, learning_rate, monitor, from_base
         )
-
-        # Step 4: train on new data
-        history = model.fit(
-            X_train,
-            Y_train_norm,
-            validation_data=(X_val, Y_val_norm),
-            epochs=60,  # fewer epochs than original training
-            batch_size=256,
-            callbacks=[early_stop, reduce_lr],
-            verbose=2,
-        )
-
-        trained_models.append((model, Y_mean, Y_std))  # save model + its normalisation
+        trained_models.append(trained)
         histories.append(history)
 
-    return trained_models, histories
+    return trained_models, histories, base_history

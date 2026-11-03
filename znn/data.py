@@ -21,6 +21,9 @@ __all__ = [
 DEFAULT_FEATURE_CONFIG = {
     "nondetect_value": np.inf,  # np.inf treats non-detections as unobserved
     "n_lambda": 1000,  # points in the common wavelength grid
+    # (min, max) of the grid, in Å: the LSST ugrizy + Roman Y106/J129/H158 span, which the bundled pre-trained
+    # weights use. None spans the bands' filter curves instead.
+    "lambda_range": (3000.0, 18650.0),
     "n_bins": 32,  # wavelength bins fed to the CNN
     "apply_stretch": False,
     "c": 0.8,
@@ -226,7 +229,11 @@ def catalog_to_XY(df, bands, ref_band, config=DEFAULT_FEATURE_CONFIG, filter_cur
     filter_curves: optional pre-loaded curves, as returned by znn.io.load_filter_curves; when
         None they are read from the paths in `bands`.
 
-    The common wavelength grid spans the full range of the bands' filter curves.
+    The common wavelength grid spans config["lambda_range"], in the filter curves' wavelength
+    units. Fix it to compare or combine catalogues observed in different filters: each bin then
+    covers the same wavelengths whatever the bands, and filter curves outside the range are
+    ignored. When it is None (or missing, as in older configs) the grid spans the full range of
+    the bands' filter curves.
 
     Returns (X, Y): X of shape (n_sources, n_bins, 3), and Y the "redshift" column, or None
     when df has none (e.g. test catalogues).
@@ -234,8 +241,12 @@ def catalog_to_XY(df, bands, ref_band, config=DEFAULT_FEATURE_CONFIG, filter_cur
     if filter_curves is None:
         filter_curves = load_filter_curves(bands)
 
-    lambda_min = min(curve[:, 0].min() for curve in filter_curves.values())
-    lambda_max = max(curve[:, 0].max() for curve in filter_curves.values())
+    lambda_range = config.get("lambda_range")
+    if lambda_range is None:
+        lambda_min = min(curve[:, 0].min() for curve in filter_curves.values())
+        lambda_max = max(curve[:, 0].max() for curve in filter_curves.values())
+    else:
+        lambda_min, lambda_max = lambda_range
     lambda_common = np.linspace(lambda_min, lambda_max, config["n_lambda"])
     filters_array = interpolate_filter_curves(filter_curves, lambda_common)
 
@@ -268,10 +279,12 @@ def resample_photometry(df, errors, rng):
 
     The noise is Gaussian in flux, f = 10**(-0.4 m) with sigma_f = 0.4 ln(10) f sigma_m, as photometric
     noise is; draws with f <= 0 become non-detections (np.nan). Magnitudes or errors that are not finite
-    (non-detections, unobserved bands) are left unchanged.
+    (non-detections, unobserved bands), and bands whose error column is not in df, are left unchanged.
     """
     out = df.copy()
     for mag_column, err_column in errors.items():
+        if err_column not in df:
+            continue
         mag = df[mag_column].to_numpy(dtype=float)
         err = df[err_column].to_numpy(dtype=float)
         ok = np.isfinite(mag) & np.isfinite(err)
