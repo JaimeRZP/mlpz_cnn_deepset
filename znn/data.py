@@ -14,7 +14,6 @@ __all__ = [
     "transform_data_to_XY",
     "make_incomplete_nir_data",
     "catalog_to_XY",
-    "resample_photometry",
 ]
 
 # Processing settings for catalog_to_XY; the bands themselves are always supplied by the user.
@@ -267,34 +266,3 @@ def catalog_to_XY(df, bands, ref_band, config=DEFAULT_FEATURE_CONFIG, filter_cur
         missingY=not has_redshift,
     )
     return X, (Y if has_redshift else None)
-
-
-def resample_photometry(df, errors, rng):
-    """
-    Return a copy of a catalogue with its magnitudes redrawn from their photometric errors: one noise
-    realization of the photometry.
-
-    errors: dict magnitude column -> its error column, e.g. {"mag_u_lsst": "mag_u_lsst_err", ...}.
-    rng: numpy Generator, e.g. np.random.default_rng(seed).
-
-    The noise is Gaussian in flux, f = 10**(-0.4 m) with sigma_f = 0.4 ln(10) f sigma_m, as photometric
-    noise is; draws with f <= 0 become non-detections (np.nan). Magnitudes or errors that are not finite
-    (non-detections, unobserved bands), and bands whose error column is not in df, are left unchanged.
-    """
-    out = df.copy()
-    for mag_column, err_column in errors.items():
-        if err_column not in df:
-            continue
-        mag = df[mag_column].to_numpy(dtype=float)
-        err = df[err_column].to_numpy(dtype=float)
-        ok = np.isfinite(mag) & np.isfinite(err)
-
-        flux = 10 ** (-0.4 * mag[ok])
-        flux_new = flux + 0.4 * np.log(10) * flux * err[ok] * rng.standard_normal(ok.sum())
-
-        mag_new = mag.copy()
-        mag_new[ok] = np.nan
-        detected = flux_new > 0
-        mag_new[np.flatnonzero(ok)[detected]] = -2.5 * np.log10(flux_new[detected])
-        out[mag_column] = mag_new
-    return out

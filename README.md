@@ -1,11 +1,11 @@
 # znn
 
-Photometric redshifts from an ensemble of 1-D convolutional neural networks.
+Photometric redshifts from a pair of 1-D convolutional neural networks.
 
 Each galaxy's photometry is turned into a short "spectrum" on a common wavelength grid by spreading
-every band's magnitude over its filter curve. An ensemble of CNNs, one per K-fold split of the
-training set, predicts a redshift from it. The per-object p(z) is a Gaussian whose mean and width
-come from the spread of the ensemble's predictions, optionally including the photometric errors.
+every band's magnitude over its filter curve. One CNN, F, predicts a redshift from it. A second CNN, G,
+trained on F's residuals, predicts how far off F is likely to be. The per-object p(z) is a Student-t
+in log(1 + z) centred on F's prediction, with G's predicted scale.
 
 ## Installation
 
@@ -20,7 +20,6 @@ columns instead of a `qp.Ensemble`.
 ## Quick start
 
 ```python
-import numpy as np
 import znn
 
 # band -> (catalogue magnitude column, filter curve file), ordered by wavelength.
@@ -38,31 +37,18 @@ REF_BAND = "i"  # every magnitude is taken relative to this band
 train = znn.read_catalog("training.hdf5")  # needs a "redshift" column
 test = znn.read_catalog("test.hdf5")
 
-# Features and training, starting from the pop-cosmos pre-trained weights (pretraining=None: from scratch)
-X, z = znn.catalog_to_XY(train, BANDS, REF_BAND)
-models, histories = znn.train_ensembles(znn.build_model, X, z, N_SPLITS=5)
+# Training, with F starting from the pop-cosmos pre-trained weights (pretraining=None: from scratch); the features
+# are built from the catalogue, and the redshifts are its "redshift" column unless given as Y
+model, histories = znn.train_model(znn.build_model, train, BANDS, REF_BAND)
 
-# p(z) from the spread of the ensemble members
-X_test, _ = znn.catalog_to_XY(test, BANDS, REF_BAND)
-pz = znn.ensemble_predict(models, X_test, ids=test["object_id"].to_numpy())
-
-# p(z) with the photometric errors propagated: 50 noise draws, each through every member
-errors = {column: f"{column}_err" for column, _ in BANDS.values()}
-pz = znn.ensemble_predict_resampled(
-    models, test, errors, 50, np.random.default_rng(42), BANDS, REF_BAND, ids=test["object_id"].to_numpy()
-)
+# p(z) of the test catalogue
+pz = znn.predict(model, test, BANDS, REF_BAND, ids=test["object_id"].to_numpy())
 pz.write_to("pz_estimate.hdf5")
 
-# Or train from the catalogue, each member fine-tuned on its own K-fold cut from a base model trained on
-# all the objects
-models, histories, base_history = znn.train_from_catalog(
-    znn.build_model, train, train["redshift"].to_numpy(), BANDS, REF_BAND, N_MEMBERS=10, from_base=True
-)
-
-# Save the ensemble with everything needed to rebuild its inputs, then reload it
-znn.save_ensemble_file("model.pkl", models, BANDS, REF_BAND, znn.DEFAULT_FEATURE_CONFIG)
-models, features = znn.load_ensemble_file("model.pkl")
-X_test, _ = znn.catalog_to_XY(test, **features)
+# Save the model with everything needed to rebuild its inputs, then reload it
+znn.save_model_file("model.pkl", model, BANDS, REF_BAND, znn.DEFAULT_FEATURE_CONFIG)
+model, features = znn.load_model_file("model.pkl")
+pz = znn.predict(model, test, **features)
 ```
 
 ## How it works
@@ -81,45 +67,43 @@ X_test, _ = znn.catalog_to_XY(test, **features)
      | 1 | the bin's position along the wavelength axis, from 0 to 1 |
      | 2 | coverage: the fraction of the bin backed by observed bands, from 0 to 1 |
 
-2. **An ensemble of CNNs** (`train_ensembles`)
-   - The training set is split K ways (`N_SPLITS`), and one model is trained per fold, using the
-     other folds as its validation set.
-   - The model is `build_model`, a residual net with squeeze-excitation (273k parameters: a
-     kernel-7 stem, 3 stages of 2 blocks, global average pooling and a dense head).
-   - Each member predicts a single redshift, trained with an MSE loss on log(1 + z), standardised with
-     the training mean and std. A `ToRedshift` layer appended to the trained model maps its output back to z.
-   - Training uses early stopping and reduces the learning rate when the validation loss plateaus.
-   - **Pre-training** (`pretraining`): by default every member starts from `"popcosmos"`, the model
-     shipped in `znn/pretrained/popcosmos.keras` (`znn.load_pretrained`); nothing is frozen, it only sets
-     the starting weights. It was trained with `train_model` on 160k galaxies of the pop-cosmos mock
+2. **Two networks** (`train_model`), after the moment networks of Jeffrey & Wandelt
+   (2020, arXiv:2011.05991)
+   - Both are `build_model`, a residual net with squeeze-excitation (273k parameters: a kernel-7 stem,
+     3 stages of 2 blocks, global average pooling and a dense head), as separate instances.
+   - **F** (`train_mean_model`) predicts a single redshift, trained with an MSE loss on log(1 + z), standardised
+     with the training mean and std. A `ToRedshift` layer appended to the trained network maps its output back to z.
+   - **G** (`train_scale_model`) is trained afterwards, from scratch, on F's residuals on the same objects, with F
+     fixed. It predicts the log squared scale of a Student-t with `nu` degrees of freedom (default 5), trained by
+     its negative log-likelihood. The Student-t keeps the rare catastrophic residuals from setting everyone's
+     width, which a Gaussian (the paper's eq. 5, its `nu` → ∞ limit) does not, and gives the p(z) heavy tails.
+   - Both hold out a random `VAL_FRAC` (default 20%) for early stopping, and reduce the learning rate when the
+     validation loss plateaus. Training uses the photometry as given; the errors are not used.
+   - **Pre-training** (`pretraining`): by default F starts from `"popcosmos"`, the network shipped in
+     `znn/pretrained/popcosmos.keras` (`znn.load_pretrained`); nothing is frozen, it only sets the starting
+     weights. It was trained with `train_mean_model` on 160k galaxies of the pop-cosmos mock
      (Zenodo 10.5281/zenodo.17132433, v1.1.0, HSC i < 25.5; 40k more held out for early stopping) in its
      23 COSMOS2020 bands within the default grid, at their native depth. On 50k other mock galaxies:
      bias −0.0001, scatter 0.017, 3σ outliers 4.8%. Your inputs must use the default feature config.
-     `pretraining=None` trains from scratch; a `.keras` path or an ensemble (its first member) also works.
-   - `train_from_catalog` trains from the catalogue, on the photometry as given (the errors are only
-     used in prediction). With `from_base=True`, a base model is first trained on all the objects, then
-     each member is a copy of it fine-tuned on its own fold (`FINETUNE_EPOCHS` at `FINETUNE_LR`,
-     no early stopping), with the base's stem (first `N_FROZEN_LAYERS` layers) frozen.
+     `pretraining=None` trains F from scratch; a `.keras` path or a trained model (its F) also works. G always
+     starts from scratch.
 
-3. **p(z)** (`ensemble_predict`, `ensemble_predict_resampled`)
-   - `ensemble_predict` gives each object a Gaussian with the mean and standard deviation of the K
-     members' predictions.
-   - `ensemble_predict_resampled` also redraws the photometry S times from its errors and runs every
-     member on every draw. The width then includes the photometric errors as well as the
-     disagreement between members.
-   - With `return_components=True`, it also returns the two parts of the width, "model" and
-     "photometric". They add in quadrature to the total.
+3. **p(z)** (`predict`)
+   - Each object gets a Student-t in log(1 + z), centred on log(1 + F's prediction), with G's scale and `nu`
+     degrees of freedom, converted to z and evaluated on a grid (`DEFAULT_ZGRID`, 0 to 3 in steps of 0.005).
+   - The p(z) is predicted on the photometry as given. G's scale already includes the photometric noise of the
+     data it was trained on, so drawing noise realizations on top would count it twice.
 
 ## Package layout
 
 | Module | Purpose | Main functions |
 |---|---|---|
 | `znn/io.py` | Reading catalogues and filter curves | `read_catalog`, `load_filter_curves`, `catalog_to_mags` |
-| `znn/data.py` | Building CNN inputs and resampling photometry | `catalog_to_XY`, `resample_photometry`, `DEFAULT_FEATURE_CONFIG` |
-| `znn/models.py` | The model, training, prediction, saving and loading | `build_model`, `train_ensembles`, `train_from_catalog`, `train_model`, `load_pretrained`, `ensemble_predict`, `ensemble_predict_resampled`, `save_ensemble_file`, `load_ensemble_file` |
-| `znn/qp_output.py` | Packaging predictions as p(z) | `package_predictions`, `save_predictions` |
+| `znn/data.py` | Building CNN inputs | `catalog_to_XY`, `DEFAULT_FEATURE_CONFIG` |
+| `znn/models.py` | The model, training, prediction, saving and loading | `build_model`, `train_model`, `train_mean_model`, `train_scale_model`, `load_pretrained`, `predict`, `save_model_file`, `load_model_file` |
+| `znn/qp_output.py` | Packaging predictions as p(z) | `package_pdfs`, `predictions_mean_std` |
 | `znn/stats.py` | Robust point-estimate statistics | `get_biweight_mean_sigma_outlier`, `get_all_stats`, `stats_to_markdown` |
-| `znn/plotting.py` | Diagnostic plots | `plot_stats`, `compare_binned_stats`, `plot_ensemble_losses`, `visualize_the_data` |
+| `znn/plotting.py` | Diagnostic plots | `plot_stats`, `compare_binned_stats`, `plot_losses`, `visualize_the_data` |
 
 Everything is importable from the top level, e.g. `znn.catalog_to_XY`.
 
@@ -147,27 +131,20 @@ The lower-level steps behind `catalog_to_XY` live in `data.py` and are useful on
   coverage.
 - A band whose column is missing from the catalogue is unobserved for every object.
 
-**`errors`**
-- A dict `magnitude column -> error column`, used by `resample_photometry` and
-  `ensemble_predict_resampled`.
-- Noise is drawn in flux. A draw with negative flux becomes a non-detection.
-
 **Feature settings**
 - `DEFAULT_FEATURE_CONFIG` sets the wavelength grid (`n_lambda`), the number of bins (`n_bins`)
   and how non-detections are handled.
 - Pass a modified copy as `config` to change them.
 
-**Ensembles**
-- A trained ensemble is a list of `(model, Y_mean, Y_std)` tuples, one per member. Predictions are
-  `model.predict(X) * Y_std + Y_mean`. The models end in `ToRedshift` and output z, so members are
-  `(model, 0, 1)`; `ToRedshift` is registered with Keras when `znn` is imported, so they load as usual.
+**Models**
+- A trained model is a tuple `(F, G, nu)`. F outputs z (it ends in `ToRedshift`, registered with Keras when
+  `znn` is imported, so it loads as usual); G outputs the log squared scale of the Student-t in log(1 + z).
 
 **Saved models**
-- `save_ensemble_file` writes one pickle holding each member's architecture and weights, plus the
-  feature settings and the filter curves themselves. Estimation then does not need the filter
-  files.
-- `save_ensemble` / `load_ensemble` write the older layout: a directory of `.keras` files and
-  `norm_params.json`.
+- `save_model_file` writes one pickle holding F's and G's architecture and weights, `nu`, the feature
+  settings and the filter curves themselves. Estimation then does not need the filter files.
+- `load_model_file` also reads the files of the earlier layout of the same model, a two-member list
+  `[(F, 0, 1), (G, log s², nu)]`.
 
 **Statistics**
 - `get_biweight_mean_sigma_outlier(dz)` returns a 5-tuple for dz = (z_pred − z_true) / (1 + z_true),

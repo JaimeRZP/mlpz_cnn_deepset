@@ -9,7 +9,7 @@ runs if every task set succeeded.
 
 Settings in the notebooks' configuration cells can be overridden with --set NAME=VALUE (VALUE is Python source,
 so strings need quotes). The override replaces the line that assigns NAME, so values derived from it later in the
-cell (e.g. RUN from FROM_BASE) follow. The RUN of the task-set notebooks is passed on to the results notebook.
+cell (e.g. RUN from NU) follow. The RUN of the task-set notebooks is passed on to the results notebook.
 
 Examples (from the repo root):
     python run_challenge.py                              # task sets 1-4, then the results
