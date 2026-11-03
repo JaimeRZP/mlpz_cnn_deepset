@@ -24,6 +24,10 @@ qp = ["qp-prob>=1.0.1"]
 [tool.setuptools]
 packages = ["znn"]
 
+[tool.setuptools.package-data]
+# pre-trained models shipped with the package (znn.load_pretrained)
+znn = ["pretrained/*.keras"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py39"
