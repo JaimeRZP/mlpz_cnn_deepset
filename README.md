@@ -43,13 +43,13 @@ test = znn.read_catalog("test.hdf5")
 # all starting from the pop-cosmos weights (pretraining=None: from scratch)
 errors = {column: f"{column}_err" for column, _ in BANDS.values()}
 models, histories, _ = znn.train_from_catalog(
-    znn.build_model, train, train["redshift"].to_numpy(), BANDS, REF_BAND, errors=errors,
+    znn.build_model_res_se, train, train["redshift"].to_numpy(), BANDS, REF_BAND, errors=errors,
     rng=np.random.default_rng(42), N_MEMBERS=5,
 )
-# or the residual squeeze-excitation net, from scratch, with a log(1 + z) target and a Huber loss
+# or from scratch, with a Huber loss
 models, histories, _ = znn.train_from_catalog(
     znn.build_model_res_se, train, train["redshift"].to_numpy(), BANDS, REF_BAND, errors=errors,
-    rng=np.random.default_rng(42), N_MEMBERS=5, pretraining=None, target="log1pz", loss="huber",
+    rng=np.random.default_rng(42), N_MEMBERS=5, pretraining=None, loss="huber",
 )
 
 # p(z) with the photometric errors propagated: 50 noise draws, each through every member
@@ -61,7 +61,7 @@ pz.write_to("pz_estimate.hdf5")
 
 # The same at the matrix level, from inputs you build yourself (no noise realizations)
 X, z = znn.catalog_to_XY(train, BANDS, REF_BAND)
-models, histories = znn.train_ensembles(znn.build_model, X, z, N_SPLITS=5)
+models, histories = znn.train_ensembles(znn.build_model_res_se, X, z, N_SPLITS=5)
 X_test, _ = znn.catalog_to_XY(test, BANDS, REF_BAND)
 pz = znn.ensemble_predict(models, X_test, ids=test["object_id"].to_numpy())
 
@@ -97,51 +97,42 @@ X_test, _ = znn.catalog_to_XY(test, **features)
    - `from_base=True` is cheaper per member: one base model is trained on all the objects with the
      photometry as given (with `VAL_FRAC` of them held out for its early stopping), then every member is a
      copy of it fine-tuned on its own realization and fold at
-     `FINETUNE_LR` (default 3e-4) for `FINETUNE_EPOCHS` (default 10). The base model has seen every
+     `FINETUNE_LR` (default 3e-4) for `FINETUNE_EPOCHS` (default 10), with the base model's stem (its first
+     `N_FROZEN_LAYERS` layers) frozen, so it is the same in every member. The base model has seen every
      member's validation fold, so the fine-tuning has no early stopping or learning-rate reduction.
    - `train_ensembles` is the matrix-level building block: the same training from inputs you build
      yourself (one array for all members, or one per member), with the same K-fold cuts.
-   - Each member predicts a single redshift, trained with an MSE loss. Targets are scaled as z / 3.
+   - The model is `build_model_res_se`, a residual net with squeeze-excitation (273k parameters: a
+     kernel-7 stem, 3 stages of 2 blocks, global average pooling and a dense head).
+   - Each member predicts a single redshift, trained with an MSE loss on log(1 + z), standardised with
+     each member's training mean and std. A `ToRedshift` layer is appended to each trained model, so it
+     outputs z.
    - Full training uses early stopping and reduces the learning rate when the validation loss plateaus.
-   - **Pre-training (default):** every member starts from a copy of one pre-trained model, with its
-     first two convolutional blocks frozen, and trains with the same settings as from scratch.
+   - **Pre-training (default):** training starts from a copy of one pre-trained model, every layer
+     trainable (nothing is frozen), with the same settings as from scratch: the pre-training only sets
+     the starting weights.
      - `pretraining="popcosmos"` (default): a model shipped with znn, trained on 200k galaxies of the
        pop-cosmos mock (Zenodo v1.1.0, i < 25.5) in 23 COSMOS2020 bands at their native depth, on the
        default grid. Its inputs used the default feature config, so yours must too.
      - Shipped pre-trainings are named after the options they were trained with:
-       `znn/pretrained/<name>_<build_model_func>_<target>.{json,npz}` (`znn.pretrained_name`). The
-       variant matching the `build_model_func` and `target` you train with is loaded, and an error lists
-       the shipped variants if there is none. Shipped so far: `popcosmos_build_model_z3` (member 0 of a
-       5-member ensemble, the others dropped since starting every member from one model scored as well).
-       `znn.load_pretrained("popcosmos", build_model_func, target)` returns a variant with its config and
+       `znn/pretrained/<name>_<build_model_func>.{json,npz}` (`znn.pretrained_name`). The
+       variant matching the `build_model_func` you train with is loaded, and an error lists
+       the shipped variants if there is none. Shipped: `popcosmos_build_model_res_se` (one model;
+       160k galaxies for training, 40k for early stopping).
+       `znn.load_pretrained("popcosmos", build_model_func)` returns a variant with its config and
        provenance.
      - `pretraining=None`: train every member from scratch.
      - Your own: a list of `(model, Y_mean, Y_std)`, a `save_ensemble_file` `.pkl` path, or a
        `save_pretrained` path; of an ensemble, its first member is used. Its inputs must be on the same grid
-       as yours, it must have been trained with the same `target`, and a `save_pretrained` pair must have
+       as yours, it must have been trained on log(1 + z) (end in `ToRedshift`), and a `save_pretrained` pair must have
        been saved with the same `build_model_func`.
      - Pre-training checks the input shape against the pre-trained models but cannot check the grid itself.
      - To add a pre-training: train one model with `member, _ = znn.train_model(build_model_func, X, Y,
-       pretraining=None, target=target)` (a random `VAL_FRAC` held out for early stopping), then
-       `znn.save_pretrained(os.path.join(znn.PRETRAINED_DIR, znn.pretrained_name(name, build_model_func, target)), [member], config, info, build_model_func=build_model_func)`.
+       pretraining=None)` (a random `VAL_FRAC` held out for early stopping), then
+       `znn.save_pretrained(os.path.join(znn.PRETRAINED_DIR, znn.pretrained_name(name, build_model_func)), [member], config, info, build_model_func=build_model_func)`.
        `popcosmos_pretraining.ipynb` does this on the pop-cosmos mock.
-   - Options (the defaults reproduce the above):
-     - `target="log1pz"` trains on log(1 + z), standardised with each member's training mean and std.
-       A `ToRedshift` layer is appended to each trained model, so it still outputs z. A pre-trained
-       model must have been trained with the same `target` (an error is raised otherwise); a log1pz one
-       is fine-tuned in the log(1 + z) normalisation it was pre-trained with.
-     - `loss="huber"` uses a Huber loss; `huber_delta` (default 0.05) is given in dz / (1 + z).
-
-   | Architecture | Parameters | Description |
-   |---|---|---|
-   | `build_model` | 1.34M | 6 convs, 3 poolings, global average pooling, dense head |
-   | `build_model_v2_k7` | 557k | 5 convs, 4 poolings, a first kernel of 7, same head |
-   | `build_model_res_se` | 273k | residual net with squeeze-excitation: kernel-7 stem, 3 stages of 2 blocks, same head |
-
-   Only `build_model` has a shipped pre-training so far, so the other architectures need
-   `pretraining=None` until one of theirs is added.
-   The best setups found were `build_model_res_se` with `target="log1pz"` (MSE or Huber), then
-   `build_model_v2_k7` with `target="log1pz"`. The log(1 + z) target helped every architecture.
+   - A pre-trained model is fine-tuned in the log(1 + z) normalisation it was pre-trained with.
+   - Option: `loss="huber"` uses a Huber loss; `huber_delta` (default 0.05) is given in dz / (1 + z).
 
 3. **p(z)** (`predict_from_catalog`, built on `ensemble_predict`)
    - `predict_from_catalog` redraws the catalogue's photometry S times (`n_samples`) from its errors and
@@ -159,7 +150,7 @@ X_test, _ = znn.catalog_to_XY(test, **features)
 |---|---|---|
 | `znn/io.py` | Reading catalogues and filter curves | `read_catalog`, `load_filter_curves`, `catalog_to_mags` |
 | `znn/data.py` | Building CNN inputs and resampling photometry | `catalog_to_XY`, `resample_photometry`, `has_errors`, `DEFAULT_FEATURE_CONFIG` |
-| `znn/models.py` | Architectures, target scaling, losses, training, prediction, saving and loading | `build_model`, `build_model_v2_k7`, `build_model_res_se`, `train_from_catalog`, `predict_from_catalog`, `train_ensembles`, `train_model`, `ensemble_predict`, `save_ensemble_file`, `load_ensemble_file`, `save_pretrained`, `load_pretrained` |
+| `znn/models.py` | The model, target scaling, losses, training, prediction, saving and loading | `build_model_res_se`, `train_from_catalog`, `predict_from_catalog`, `train_ensembles`, `train_model`, `ensemble_predict`, `save_ensemble_file`, `load_ensemble_file`, `save_pretrained`, `load_pretrained` |
 | `znn/qp_output.py` | Packaging predictions as p(z) | `package_samples`, `save_predictions` |
 | `znn/stats.py` | Robust point-estimate statistics | `get_biweight_mean_sigma_outlier`, `get_all_stats`, `stats_to_markdown` |
 | `znn/plotting.py` | Diagnostic plots | `plot_stats`, `compare_binned_stats`, `plot_ensemble_losses`, `visualize_the_data` |
@@ -204,7 +195,7 @@ The lower-level steps behind `catalog_to_XY` live in `data.py` and are useful on
 **Ensembles**
 - A trained ensemble is a list of `(model, Y_mean, Y_std)` tuples, one per member. Predictions are
   `model.predict(X) * Y_std + Y_mean`.
-- With `target="log1pz"` the model ends in a `ToRedshift` layer that outputs z, and the member is
+- The model ends in a `ToRedshift` layer that outputs z, and the member is
   `(model, 0, 1)`, so every prediction and saving function works unchanged.
 
 **Saved models**
