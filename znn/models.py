@@ -4,6 +4,7 @@ import pickle
 
 import numpy as np
 import tensorflow as tf
+from scipy import stats
 from sklearn.model_selection import KFold, train_test_split
 from tensorflow.keras import callbacks, layers, models
 
@@ -481,48 +482,68 @@ def train_from_catalog(
     return trained_models, histories, base_history
 
 
-# --- Moment networks (Jeffrey & Wandelt 2020, arXiv:2011.05991) ---
-# A trained model F predicts the mean of the standardised log(1 + z); a second network G, trained on F's squared
-# residuals with F fixed, predicts their variance. The pair is stored as a two-member list [(F, 0, 1), (G, 0, s**2)],
-# with s the standardisation of F's ToRedshift layer, so G.predict(X) * s**2 is the variance of log(1 + z), and
-# save_ensemble_file / load_ensemble_file store it as any ensemble.
-DEFAULT_ZGRID = np.linspace(0, 3, 301)  # where moment_predict_resampled evaluates p(z)
+# --- Moment networks (after Jeffrey & Wandelt 2020, arXiv:2011.05991) ---
+# A trained model F predicts the standardised log(1 + z); a second network G, trained on F's residuals with F fixed,
+# predicts their spread. G predicts the log squared scale of a Student-t with nu degrees of freedom, trained by its
+# negative log-likelihood: eq. 5 of the paper (MSE on the squared residuals, i.e. the variance) is the nu -> infinity
+# limit, but is dominated by the rare catastrophic residuals and gives too wide p(z)s. The pair is stored as a
+# two-member list [(F, 0, 1), (G, log s**2, nu)], with s the standardisation of F's ToRedshift layer, so
+# G.predict(X) + log s**2 is the log squared scale in log(1 + z), and save_ensemble_file / load_ensemble_file store it
+# as any ensemble.
+DEFAULT_ZGRID = np.linspace(0, 3, 601)  # where moment_predict_resampled evaluates p(z); finer than the narrowest p(z)s
+
+
+def _student_t_nll(nu):
+    """Keras loss: the Student-t negative log-likelihood (no constants) of residuals y, given the log squared scale."""
+
+    def loss(y, log_scale2):
+        return tf.reduce_mean(
+            0.5 * log_scale2 + 0.5 * (nu + 1) * tf.math.log1p(tf.square(y) * tf.exp(-log_scale2) / nu)
+        )
+
+    return loss
 
 
 def train_variance_model(
-    build_model_func, X, Y, mean_member, VAL_FRAC=0.2, EPOCHS=100, BATCH_SIZE=256, random_state=42
+    build_model_func, X, Y, mean_member, nu=5.0, VAL_FRAC=0.2, EPOCHS=100, BATCH_SIZE=256, random_state=42
 ):
     """
-    Train a second network G on the squared residuals of a trained model F, kept fixed (eq. 5 of Jeffrey & Wandelt
-    2020): G learns the variance of F's prediction, in the standardised log(1 + z) F is trained in. G is a new
-    instance of build_model_func, trained from scratch with MSE, holding out a random VAL_FRAC for early stopping.
+    Train a second network G on the residuals of a trained model F, kept fixed: G learns the scale of a Student-t
+    with nu degrees of freedom around F's prediction, in the standardised log(1 + z) F is trained in, by its
+    negative log-likelihood. G is a new instance of build_model_func, trained from scratch, holding out a random
+    VAL_FRAC for early stopping.
 
     mean_member: F, as (model, 0, 1) from train_model (or any member: its model ends in ToRedshift).
+    nu: degrees of freedom of the Student-t; large nu tends to a Gaussian (the variance, as eq. 5 of Jeffrey &
+        Wandelt 2020).
 
-    Returns (moment_model, history), moment_model = [mean_member, (G, 0, s**2)] (see moment_predict_resampled).
+    Returns (moment_model, history), moment_model = [mean_member, (G, log s**2, nu)] (see moment_predict_resampled).
     """
     model = mean_member[0]
     to_z = model.layers[-1]
     T_pred = models.Model(model.inputs[0], to_z.input).predict(X, batch_size=4096, verbose=0).ravel()
-    R2 = ((np.log1p(Y) - to_z.mean) / to_z.std - T_pred) ** 2  # F's squared residuals, in its training units
+    R = (np.log1p(Y) - to_z.mean) / to_z.std - T_pred  # F's residuals, in its training units
     idx_train, idx_val = train_test_split(np.arange(len(Y)), test_size=VAL_FRAC, random_state=random_state)
 
     # ── Callbacks ─────────────────────────────────────────────────────────────────
     early_stop = callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
     reduce_lr = callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1)
 
-    var_model = build_model_func(input_shape=X.shape[1:])
-    var_model.compile(optimizer="adam", loss="mse")
-    history = var_model.fit(
+    scale_model = build_model_func(input_shape=X.shape[1:])
+    scale_model.compile(optimizer="adam", loss=_student_t_nll(nu))
+    history = scale_model.fit(
         X[idx_train],
-        R2[idx_train],
-        validation_data=(X[idx_val], R2[idx_val]),
+        R[idx_train],
+        validation_data=(X[idx_val], R[idx_val]),
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
         callbacks=[early_stop, reduce_lr],
         verbose=2,
     )
-    return [mean_member, (var_model, 0.0, to_z.std**2)], history
+    # an uncompiled copy, so its architecture (save_ensemble_file) does not refer to the custom loss
+    trained = build_model_func(input_shape=X.shape[1:])
+    trained.set_weights(scale_model.get_weights())
+    return [mean_member, (trained, float(np.log(to_z.std**2)), float(nu))], history
 
 
 def moment_predict_resampled(
@@ -537,28 +558,29 @@ def moment_predict_resampled(
     filter_curves=None,
     ids=None,
     zgrid=DEFAULT_ZGRID,
-    min_std=1e-3,
+    min_scale=1e-3,
 ):
     """
     Predict p(z) with a moment network, with the photometric errors propagated by Monte Carlo.
 
     For each of n_samples noise realizations of the catalogue's photometry (see resample_photometry), F and G give
-    a Gaussian in log(1 + z), with F's mean and G's variance (floored at min_std**2). The p(z) is the equal-weight
-    mixture of the n_samples Gaussians, converted to z (Jacobian 1 / (1 + z)) and evaluated on zgrid.
+    a Student-t in log(1 + z), with F's prediction as location, G's scale (floored at min_scale) and G's nu. The
+    p(z) is the equal-weight mixture of the n_samples of them, converted to z (Jacobian 1 / (1 + z)) and evaluated
+    on zgrid. With errors={} and n_samples=1, it is the one Student-t of the photometry as given.
 
-    moment_model: [(F, 0, 1), (G, 0, s**2)], as returned by train_variance_model.
+    moment_model: [(F, 0, 1), (G, log s**2, nu)], as returned by train_variance_model.
     Other arguments as for ensemble_predict_resampled.
 
     Returns the p(z) on zgrid, as a qp interp Ensemble (or the fallback DataFrame, see package_pdfs).
     """
-    (mean_model, _, _), (var_model, var_mean, var_scale) = moment_model
+    (mean_model, _, _), (scale_model, log_s2, nu) = moment_model
     log_grid = np.log1p(zgrid)
     pdfs = np.zeros((len(df), len(zgrid)))
     for _ in range(n_samples):
         X, _ = catalog_to_XY(resample_photometry(df, errors, rng), bands, ref_band, config, filter_curves=filter_curves)
         mu = np.log1p(mean_model.predict(X, batch_size=4096, verbose=0).ravel())
-        var = var_model.predict(X, batch_size=4096, verbose=0).ravel() * var_scale + var_mean
-        sigma = np.sqrt(np.maximum(var, min_std**2))
-        pdfs += np.exp(-0.5 * ((log_grid - mu[:, None]) / sigma[:, None]) ** 2) / (np.sqrt(2 * np.pi) * sigma[:, None])
+        log_scale2 = scale_model.predict(X, batch_size=4096, verbose=0).ravel() + log_s2
+        scale = np.maximum(np.exp(0.5 * log_scale2), min_scale)
+        pdfs += stats.t.pdf(log_grid, nu, loc=mu[:, None], scale=scale[:, None])
     pdfs /= n_samples * (1 + zgrid)
     return package_pdfs(zgrid, pdfs, ids=ids)
