@@ -7,7 +7,7 @@ import tensorflow as tf
 from sklearn.model_selection import KFold, train_test_split
 from tensorflow.keras import callbacks, layers, models
 
-from .data import DEFAULT_FEATURE_CONFIG, catalog_to_XY, has_errors, resample_photometry
+from .data import DEFAULT_FEATURE_CONFIG, catalog_to_XY, resample_photometry
 from .io import load_filter_curves
 from .qp_output import package_predictions
 
@@ -169,8 +169,7 @@ def ensemble_predict_resampled(
     Draws n_samples noise realizations of the catalogue's photometry (see resample_photometry), runs
     every ensemble member on every realization, and packages the n_samples x n_members predictions per
     object as a Gaussian p(z) with their mean and std. The number of realizations is independent of the
-    number of members. If df has no errors (errors=None, or see has_errors) there is one realization, the
-    photometry as given.
+    number of members.
 
     trained_models: list of (model, Y_mean, Y_std), as returned by train_ensembles.
     df: the catalogue to predict on (see znn.io.read_catalog).
@@ -187,12 +186,9 @@ def ensemble_predict_resampled(
       - "model": spread between members on the same realization, averaged over realizations;
       - "photometric": spread of the ensemble mean across realizations.
     """
-    noisy = has_errors(df, errors)
-    n_samples = n_samples if noisy else 1
     predictions = np.empty((n_samples, len(trained_models), len(df)))
     for s in range(n_samples):
-        draw = resample_photometry(df, errors, rng) if noisy else df
-        X, _ = catalog_to_XY(draw, bands, ref_band, config, filter_curves=filter_curves)
+        X, _ = catalog_to_XY(resample_photometry(df, errors, rng), bands, ref_band, config, filter_curves=filter_curves)
         for k, (model, Y_mean, Y_std) in enumerate(trained_models):
             predictions[s, k] = model.predict(X, batch_size=4096, verbose=0).ravel() * Y_std + Y_mean
 
@@ -435,8 +431,6 @@ def train_from_catalog(
     ref_band,
     config=DEFAULT_FEATURE_CONFIG,
     filter_curves=None,
-    errors=None,
-    rng=None,
     N_MEMBERS=5,
     from_base=False,
     EPOCHS=100,
@@ -448,37 +442,27 @@ def train_from_catalog(
     VAL_FRAC=0.2,
 ):
     """
-    Train an ensemble of N_MEMBERS models on a catalogue, as train_ensembles, with member k on its own noise
-    realization of the photometry (drawn from errors just before it trains; the photometry as given if df has no
-    errors) and its own K-fold cut.
+    Train an ensemble of N_MEMBERS models on a catalogue, as train_ensembles: member k on its own K-fold cut,
+    on the photometry as given (the photometric errors are not used in training).
 
-    from_base: first train a base model from `pretraining` on all the objects with the photometry as given (a
-    random VAL_FRAC held out for early stopping), then fine-tune a copy of it per member for FINETUNE_EPOCHS at a
-    constant FINETUNE_LR, with its stem (first N_FROZEN_LAYERS layers) frozen, the same in every member. The base
-    has seen every member's validation fold, so the fine-tuning has no early stopping.
+    from_base: first train a base model from `pretraining` on all the objects (a random VAL_FRAC held out for
+    early stopping), then fine-tune a copy of it per member for FINETUNE_EPOCHS at a constant FINETUNE_LR, with
+    its stem (first N_FROZEN_LAYERS layers) frozen, the same in every member. The base has seen every member's
+    validation fold, so the fine-tuning has no early stopping.
 
     df: the training catalogue (see znn.io.read_catalog), with Y its reference redshifts in the same order.
     bands, ref_band, config, filter_curves: feature settings, as for catalog_to_XY.
-    errors: dict magnitude column -> its error column, as for resample_photometry.
-    rng: numpy Generator, e.g. np.random.default_rng(seed); needed when df has errors.
 
     Returns (trained_models, histories, base_history), base_history None without from_base.
     """
-    noisy = has_errors(df, errors)
-    if filter_curves is None:
-        filter_curves = load_filter_curves(bands)
-
-    def inputs(photometry):
-        return catalog_to_XY(photometry, bands, ref_band, config, filter_curves=filter_curves)[0]
-
-    X_given = inputs(df)
+    X, _ = catalog_to_XY(df, bands, ref_band, config, filter_curves=filter_curves)
     start = _start(pretraining)
     base_history = None
     epochs, learning_rate, monitor = EPOCHS, 1e-3, True
     if from_base:
-        print("\n=== Base model, on all objects with the photometry as given ===")
+        print("\n=== Base model, on all objects ===")
         idx_train, idx_val = train_test_split(np.arange(len(Y)), test_size=VAL_FRAC, random_state=random_state)
-        start, base_history = _train_member(build_model_func, X_given, Y, idx_train, idx_val, start, EPOCHS, BATCH_SIZE)
+        start, base_history = _train_member(build_model_func, X, Y, idx_train, idx_val, start, EPOCHS, BATCH_SIZE)
         epochs, learning_rate, monitor = FINETUNE_EPOCHS, FINETUNE_LR, False
 
     kf = KFold(n_splits=N_MEMBERS, shuffle=True, random_state=random_state)
@@ -486,7 +470,6 @@ def train_from_catalog(
     histories = []
     for member, (idx_train, idx_val) in enumerate(kf.split(np.arange(len(Y)))):
         print(f"\n--- Member {member+1}/{N_MEMBERS} ---")
-        X = inputs(resample_photometry(df, errors, rng)) if noisy else X_given
         trained, history = _train_member(
             build_model_func, X, Y, idx_train, idx_val, start, epochs, BATCH_SIZE, learning_rate, monitor, from_base
         )

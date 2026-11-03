@@ -53,11 +53,10 @@ pz = znn.ensemble_predict_resampled(
 )
 pz.write_to("pz_estimate.hdf5")
 
-# Or train from the catalogue: each member on its own noise realization of the photometry, fine-tuned
-# from a base model trained on all the objects
+# Or train from the catalogue, each member fine-tuned on its own K-fold cut from a base model trained on
+# all the objects
 models, histories, base_history = znn.train_from_catalog(
-    znn.build_model_res_se, train, train["redshift"].to_numpy(), BANDS, REF_BAND, errors=errors,
-    rng=np.random.default_rng(42), N_MEMBERS=10, from_base=True,
+    znn.build_model_res_se, train, train["redshift"].to_numpy(), BANDS, REF_BAND, N_MEMBERS=10, from_base=True
 )
 
 # Save the ensemble with everything needed to rebuild its inputs, then reload it
@@ -97,9 +96,9 @@ X_test, _ = znn.catalog_to_XY(test, **features)
      23 COSMOS2020 bands within the default grid, at their native depth. On 50k other mock galaxies:
      bias −0.0001, scatter 0.017, 3σ outliers 4.8%. Your inputs must use the default feature config.
      `pretraining=None` trains from scratch; a `.keras` path or an ensemble (its first member) also works.
-   - `train_from_catalog` trains from the catalogue, each member on its own noise realization of the
-     photometry. With `from_base=True`, a base model is first trained on all the objects, then each
-     member is a copy of it fine-tuned on its realization and fold (`FINETUNE_EPOCHS` at `FINETUNE_LR`,
+   - `train_from_catalog` trains from the catalogue, on the photometry as given (the errors are only
+     used in prediction). With `from_base=True`, a base model is first trained on all the objects, then
+     each member is a copy of it fine-tuned on its own fold (`FINETUNE_EPOCHS` at `FINETUNE_LR`,
      no early stopping), with the base's stem (first `N_FROZEN_LAYERS` layers) frozen.
 
 3. **p(z)** (`ensemble_predict`, `ensemble_predict_resampled`)
@@ -107,7 +106,7 @@ X_test, _ = znn.catalog_to_XY(test, **features)
      members' predictions.
    - `ensemble_predict_resampled` also redraws the photometry S times from its errors and runs every
      member on every draw. The width then includes the photometric errors as well as the
-     disagreement between members. A catalogue with no errors gets a single draw.
+     disagreement between members.
    - With `return_components=True`, it also returns the two parts of the width, "model" and
      "photometric". They add in quadrature to the total.
 
@@ -116,7 +115,7 @@ X_test, _ = znn.catalog_to_XY(test, **features)
 | Module | Purpose | Main functions |
 |---|---|---|
 | `znn/io.py` | Reading catalogues and filter curves | `read_catalog`, `load_filter_curves`, `catalog_to_mags` |
-| `znn/data.py` | Building CNN inputs and resampling photometry | `catalog_to_XY`, `resample_photometry`, `has_errors`, `DEFAULT_FEATURE_CONFIG` |
+| `znn/data.py` | Building CNN inputs and resampling photometry | `catalog_to_XY`, `resample_photometry`, `DEFAULT_FEATURE_CONFIG` |
 | `znn/models.py` | The model, training, prediction, saving and loading | `build_model_res_se`, `train_ensembles`, `train_from_catalog`, `train_model`, `load_pretrained`, `ensemble_predict`, `ensemble_predict_resampled`, `save_ensemble_file`, `load_ensemble_file` |
 | `znn/qp_output.py` | Packaging predictions as p(z) | `package_predictions`, `save_predictions` |
 | `znn/stats.py` | Robust point-estimate statistics | `get_biweight_mean_sigma_outlier`, `get_all_stats`, `stats_to_markdown` |
