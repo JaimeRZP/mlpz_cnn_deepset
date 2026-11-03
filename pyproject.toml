@@ -25,8 +25,8 @@ qp = ["qp-prob>=1.0.1"]
 packages = ["znn"]
 
 [tool.setuptools.package-data]
-# pre-trained ensembles shipped with the package (znn.load_pretrained)
-znn = ["pretrained/*.json", "pretrained/*.npz"]
+# pre-trained models shipped with the package (znn.load_pretrained)
+znn = ["pretrained/*.keras"]
 
 [tool.ruff]
 line-length = 120

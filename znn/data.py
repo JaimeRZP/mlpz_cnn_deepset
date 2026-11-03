@@ -14,7 +14,6 @@ __all__ = [
     "transform_data_to_XY",
     "make_incomplete_nir_data",
     "catalog_to_XY",
-    "has_errors",
     "resample_photometry",
 ]
 
@@ -270,16 +269,6 @@ def catalog_to_XY(df, bands, ref_band, config=DEFAULT_FEATURE_CONFIG, filter_cur
     return X, (Y if has_redshift else None)
 
 
-def has_errors(df, errors):
-    """
-    Whether a catalogue has any photometric errors to sample over: at least one of the error columns in
-    `errors` (dict magnitude column -> error column, or None) is in df with a finite value.
-    """
-    return any(
-        err_column in df and np.isfinite(df[err_column].to_numpy(dtype=float)).any() for err_column in (errors or {}).values()
-    )
-
-
 def resample_photometry(df, errors, rng):
     """
     Return a copy of a catalogue with its magnitudes redrawn from their photometric errors: one noise
@@ -309,4 +298,3 @@ def resample_photometry(df, errors, rng):
         mag_new[np.flatnonzero(ok)[detected]] = -2.5 * np.log10(flux_new[detected])
         out[mag_column] = mag_new
     return out
-

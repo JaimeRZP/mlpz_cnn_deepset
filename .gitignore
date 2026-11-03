@@ -16,7 +16,6 @@ data/
 *.h5
 *.npy
 *.npz
-!znn/pretrained/*.npz
 *.csv
 *.parquet
 *.pq
