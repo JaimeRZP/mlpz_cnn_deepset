@@ -8,7 +8,7 @@ __all__ = [
     "plot_stats",
     "compare_binned_stats",
     "visualize_the_data",
-    "plot_ensemble_losses",
+    "plot_losses",
 ]
 
 
@@ -202,63 +202,21 @@ def visualize_the_data(X, Y, lambda_bin_centers, title="Example data vector", n_
     plt.title(title)
 
 
-def plot_ensemble_losses(histories, ylim=(0, 0.1)):
-    n_folds = len(histories)
-
-    # Define colours and line styles explicitly
-    style = {
-        "loss": {"color": "blue", "linestyle": "-"},  # solid blue
-        "val_loss": {"color": "blue", "linestyle": "--"},  # dashed blue
-        "mae": {"color": "red", "linestyle": "-"},  # solid red
-        "val_mae": {"color": "red", "linestyle": "--"},  # dashed red
-    }
-
-    # n_folds panels + 1 summary panel
-    fig, axes = plt.subplots(1, n_folds + 1, figsize=(5 * (n_folds + 1), 5), sharey=True)
-
-    # --- Individual fold panels ---
-    for fold, (ax, history) in enumerate(zip(axes[:-1], histories)):
-        for metric, s in style.items():
-            if metric in history.history:
-                ax.plot(history.history[metric], label=metric, color=s["color"], linestyle=s["linestyle"], linewidth=2)
-        ax.set_title(f"Member {fold+1}")
+def plot_losses(histories, titles=("F: MSE", "G: Student-t NLL"), ylim=None):
+    """
+    Training and validation loss per epoch, one panel per network, e.g. the histories returned by train_model.
+    Returns the figure, e.g. to save it.
+    """
+    fig, axes = plt.subplots(1, len(histories), figsize=(5 * len(histories), 4), squeeze=False)
+    for ax, history, title in zip(axes[0], histories, titles):
+        ax.plot(history.history["loss"], color="blue", linewidth=2, label="loss")
+        ax.plot(history.history["val_loss"], color="blue", linestyle="--", linewidth=2, label="val_loss")
+        ax.set_title(title)
         ax.set_xlabel("Epoch")
         ax.set_ylim(ylim)
         ax.grid(True)
         ax.legend()
-        if fold == 0:
-            ax.set_ylabel("Loss / MAE")
-
-    # --- Summary panel ---
-    ax_summary = axes[-1]
-
-    for metric, s in style.items():
-        # collect this metric across all folds that have it
-        all_folds = [h.history[metric] for h in histories if metric in h.history]
-
-        if len(all_folds) == 0:
-            continue
-
-        # pad to same length (early stopping may stop folds at different epochs)
-        max_len = max(len(f) for f in all_folds)
-        padded = [np.pad(f, (0, max_len - len(f)), mode="edge") for f in all_folds]
-
-        mean = np.mean(padded, axis=0)
-        std = np.std(padded, axis=0)
-        epochs = np.arange(max_len)
-
-        # plot mean line
-        ax_summary.plot(epochs, mean, label=metric, color=s["color"], linestyle=s["linestyle"], linewidth=2)
-
-        # plot shaded std band around mean
-        ax_summary.fill_between(epochs, mean - std, mean + std, color=s["color"], alpha=0.15)
-
-    ax_summary.set_title("Summary (mean ± std)")
-    ax_summary.set_xlabel("Epoch")
-    ax_summary.set_ylim(ylim)
-    ax_summary.grid(True)
-    ax_summary.legend()
-
-    plt.suptitle("Ensemble Model — Loss per Member", fontsize=14, y=1.02)
+    axes[0, 0].set_ylabel("Loss")
     plt.tight_layout()
     plt.show()
+    return fig

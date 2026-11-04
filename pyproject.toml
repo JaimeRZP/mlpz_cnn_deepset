@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "znn"
 version = "0.1.0"
-description = "CNN photo-z ensemble utilities: data transforms, robust stats, plotting, and model training"
+description = "CNN photo-z utilities: data transforms, robust stats, plotting, and model training"
 requires-python = ">=3.9"
 dependencies = [
     "numpy",
