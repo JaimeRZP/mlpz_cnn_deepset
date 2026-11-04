@@ -203,7 +203,10 @@ def visualize_the_data(X, Y, lambda_bin_centers, title="Example data vector", n_
 
 
 def plot_losses(histories, titles=("F: MSE", "G: Student-t NLL"), ylim=None):
-    """Training and validation loss per epoch, one panel per network, e.g. the histories returned by train_model."""
+    """
+    Training and validation loss per epoch, one panel per network, e.g. the histories returned by train_model.
+    Returns the figure, e.g. to save it.
+    """
     fig, axes = plt.subplots(1, len(histories), figsize=(5 * len(histories), 4), squeeze=False)
     for ax, history, title in zip(axes[0], histories, titles):
         ax.plot(history.history["loss"], color="blue", linewidth=2, label="loss")
@@ -216,3 +219,4 @@ def plot_losses(histories, titles=("F: MSE", "G: Student-t NLL"), ylim=None):
     axes[0, 0].set_ylabel("Loss")
     plt.tight_layout()
     plt.show()
+    return fig
