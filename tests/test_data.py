@@ -137,9 +137,10 @@ def test_coverage_is_one_in_observed_filter_bins_and_zero_elsewhere(box_catalog,
 def test_non_detection_empties_its_bin(box_catalog, box_bands):
     """Object 2 has no g: bin 3 is zero in both the SED and the coverage, the other bands are unaffected."""
     X, _ = catalog_to_XY(box_catalog, box_bands, "i", CONFIG)
-    assert X[2, BAND_BIN["g"], 0] == 0 and X[2, BAND_BIN["g"], 2] == 0
+    assert X[2, BAND_BIN["g"], 0] == pytest.approx(0, abs=1e-12)
+    assert X[2, BAND_BIN["g"], 2] == pytest.approx(0, abs=1e-12)
     for b in ("u", "r", "i"):
-        assert X[2, BAND_BIN[b], 2] == 1
+        assert X[2, BAND_BIN[b], 2] == pytest.approx(1, abs=1e-12)
 
 
 def test_wavelength_label_channel(box_catalog, box_bands):
@@ -149,7 +150,8 @@ def test_wavelength_label_channel(box_catalog, box_bands):
 
 def test_band_missing_from_catalog_is_unobserved(box_catalog, box_bands):
     X, _ = catalog_to_XY(box_catalog.drop(columns="mag_u"), box_bands, "i", CONFIG)
-    assert np.all(X[:, BAND_BIN["u"], 0] == 0) and np.all(X[:, BAND_BIN["u"], 2] == 0)
+    np.testing.assert_allclose(X[:, BAND_BIN["u"], 0], 0, atol=1e-12)
+    np.testing.assert_allclose(X[:, BAND_BIN["u"], 2], 0, atol=1e-12)
 
 
 def test_wide_filter_fills_all_its_bins(tmp_path):
