@@ -11,11 +11,16 @@ Settings in the notebooks' configuration cells can be overridden with --set NAME
 so strings need quotes). The override replaces the line that assigns NAME, so values derived from it later in the
 cell (e.g. RUN from NU) follow. The RUN of the task-set notebooks is passed on to the results notebook.
 
+The runs (models, submission files, cached predictions) are saved under --output-root, which sets the notebooks'
+OUTPUT_ROOT: by default the scratch area on NERSC, OUTPUT_ROOT_DEFAULT below. Figures and tables still go to the
+repo's plots/.
+
 Examples (from the repo root):
     python run_challenge.py                              # task sets 1-4, then the results
     python run_challenge.py --tasksets 3 4               # task sets 3 and 4, then the results
     python run_challenge.py --no-train                   # only the results notebook
     python run_challenge.py --set PRETRAINING=None        # every task set from scratch
+    python run_challenge.py --output-root outputs         # save the runs in the repo's outputs/ instead
 
 On NERSC, so it survives logging out:
     nohup python run_challenge.py > run_challenge.log 2>&1 &
@@ -37,6 +42,7 @@ except ImportError:  # pragma: no cover
 TASK_NOTEBOOK = "pz_challenge_taskset{}_e2e.ipynb"
 RESULTS_NOTEBOOK = "pz_challenge_results.ipynb"
 RUN_MARKER = "__RUN__="
+OUTPUT_ROOT_DEFAULT = "/pscratch/sd/j/jaimerz/znn"  # where the runs are saved on NERSC
 
 
 class EchoClient(NotebookClient):
@@ -101,9 +107,14 @@ def main():
     parser.add_argument("--no-results", action="store_true", help="skip the results notebook")
     parser.add_argument("--set", action="append", default=[], metavar="NAME=VALUE", help="override a setting")
     parser.add_argument("--kernel", help="Jupyter kernel (default: the one saved in each notebook)")
+    parser.add_argument("--output-root", default=OUTPUT_ROOT_DEFAULT,
+                        help=f"directory the runs are saved in (default: {OUTPUT_ROOT_DEFAULT})")
     args = parser.parse_args()
 
     overrides = dict(item.split("=", 1) for item in args.set)
+    # --set OUTPUT_ROOT=... wins over --output-root
+    overrides.setdefault("OUTPUT_ROOT", repr(args.output_root))
+    print(f"saving the runs under OUTPUT_ROOT = {overrides['OUTPUT_ROOT']}", flush=True)
     status = {}
     run = None
     start_all = time.time()
