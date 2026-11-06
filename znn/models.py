@@ -3,13 +3,12 @@ import pickle
 
 import numpy as np
 import tensorflow as tf
-from scipy import stats
 from sklearn.model_selection import train_test_split
 from tensorflow.keras import callbacks, layers, models
 
 from .data import DEFAULT_FEATURE_CONFIG, catalog_to_XY
 from .io import load_filter_curves
-from .qp_output import package_pdfs
+from .qp_output import DEFAULT_ZMAX, package_pdfs
 
 __all__ = [
     "build_model",
@@ -24,7 +23,6 @@ __all__ = [
     "PRETRAINED_DIR",
     "DEFAULT_PRETRAINING",
     "DEFAULT_NU",
-    "DEFAULT_ZGRID",
 ]
 
 # The model is a pair of networks after the moment networks of Jeffrey & Wandelt 2020 (arXiv:2011.05991): F predicts
@@ -39,7 +37,6 @@ __all__ = [
 PRETRAINED_DIR = os.path.join(os.path.dirname(__file__), "pretrained")
 DEFAULT_PRETRAINING = "popcosmos"
 DEFAULT_NU = 5.0  # degrees of freedom of the Student-t
-DEFAULT_ZGRID = np.linspace(0, 3, 601)  # where predict evaluates p(z); finer than the narrowest p(z)s
 
 
 def _squeeze_excite(x, ratio=4):
@@ -268,25 +265,23 @@ def train_model(
     return _train_model(build_model_func, X, Y, nu, VAL_FRAC, EPOCHS, BATCH_SIZE, random_state, pretraining)
 
 
-def _predict(model, X, ids=None, zgrid=DEFAULT_ZGRID, min_scale=1e-3):
+def _predict(model, X, ids=None, zmax=DEFAULT_ZMAX, min_scale=1e-3):
     """
     p(z) of features X with a trained model (F, G, nu): a Student-t in log(1 + z) with F's prediction as location,
-    G's scale (floored at min_scale) and nu degrees of freedom, converted to z (Jacobian 1 / (1 + z)) and evaluated
-    on zgrid.
+    G's scale (floored at min_scale) and nu degrees of freedom, truncated to z in [0, zmax] (see package_pdfs).
     """
     mean_model, scale_model, nu = model
     mu = np.log1p(mean_model.predict(X, batch_size=4096, verbose=0).ravel())
     scale = np.maximum(np.exp(0.5 * scale_model.predict(X, batch_size=4096, verbose=0).ravel()), min_scale)
-    pdfs = stats.t.pdf(np.log1p(zgrid), nu, loc=mu[:, None], scale=scale[:, None]) / (1 + zgrid)
-    return package_pdfs(zgrid, pdfs, ids=ids)
+    return package_pdfs(mu, scale, nu, ids=ids, zmax=zmax)
 
 
 def predict(
-    model, df, bands, ref_band, config=DEFAULT_FEATURE_CONFIG, filter_curves=None, ids=None, zgrid=DEFAULT_ZGRID
+    model, df, bands, ref_band, config=DEFAULT_FEATURE_CONFIG, filter_curves=None, ids=None, zmax=DEFAULT_ZMAX
 ):
     """
     Predict p(z) for a catalogue with a trained model (F, G, nu): a Student-t in log(1 + z) around F's prediction,
-    with G's scale and nu degrees of freedom, converted to z and evaluated on zgrid.
+    with G's scale and nu degrees of freedom, truncated to z in [0, zmax].
 
     df: the catalogue (see znn.io.read_catalog).
     bands, ref_band, config, filter_curves: the feature settings the model was trained with, as for catalog_to_XY;
@@ -296,10 +291,11 @@ def predict(
     The p(z) is predicted on the photometry as given: G's scale already includes the photometric noise of the data
     it was trained on.
 
-    Returns the p(z) on zgrid, as a qp interp Ensemble (or the fallback DataFrame, see package_pdfs).
+    Returns the p(z), as a qp interp_irregular Ensemble with zmode, zmean and zstd in its ancil (or the fallback
+    DataFrame, see package_pdfs).
     """
     X, _ = catalog_to_XY(df, bands, ref_band, config, filter_curves=filter_curves)
-    return _predict(model, X, ids=ids, zgrid=zgrid)
+    return _predict(model, X, ids=ids, zmax=zmax)
 
 
 def save_model_file(path, model, bands, ref_band, config):

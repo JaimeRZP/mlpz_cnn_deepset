@@ -1,5 +1,3 @@
-import pickle
-
 import numpy as np
 from scipy.stats import sigmaclip
 
@@ -8,9 +6,6 @@ __all__ = [
     "biweight_midvariance",
     "biweight_scale",
     "get_biweight_mean_sigma_outlier",
-    "get_all_stats",
-    "read_stats",
-    "stats_to_markdown",
 ]
 
 
@@ -73,18 +68,17 @@ def biweight_scale(data, c=9.0, ignore_nan=False, modify_sample_size=False):
     return np.sqrt(biweight_midvariance(data, c=c, ignore_nan=ignore_nan, modify_sample_size=modify_sample_size))
 
 
-def get_biweight_mean_sigma_outlier(subset, nclip=3, abs_out_thresh=0.2):
-    subset_clip, _, _ = sigmaclip(subset, low=3, high=3)
-    for _j in range(nclip):
-        subset_clip, _, _ = sigmaclip(subset_clip, low=3, high=3)
+def get_biweight_mean_sigma_outlier(subset, abs_out_thresh=0.2):
+    """
+    Point-estimate statistics of e.g. dz = (z_pred - z_ref) / (1 + z_ref). subset is 3-sigma clipped until
+    convergence, and the mean and std are the biweight location and scale of the clipped values.
+    Returns (mean, mean error, std, outlier rate, absolute outlier rate). The outlier rate is the fraction of all of
+    subset with |value| > 3 np.std(clipped); the absolute outlier rate is the fraction with |value| > abs_out_thresh.
+    """
+    subset_clip, _, _ = sigmaclip(subset, low=3, high=3)  # iterates until no more values are clipped
 
     mean = biweight_location(subset_clip)
     std = biweight_scale(subset_clip)
-    # mean = np.mean(subset_clip)
-    # std = np.std(subset_clip)
-    # outlier_rate = np.sum(np.abs(subset) > 3 * biweight_scale(subset_clip)) / len(
-    #    subset
-    # )
     outlier_rate = np.sum(np.abs(subset) > 3 * np.std(subset_clip)) / len(subset)
     abs_outlier_rate = np.sum(np.abs(subset) > abs_out_thresh) / len(subset)
 
@@ -95,70 +89,3 @@ def get_biweight_mean_sigma_outlier(subset, nclip=3, abs_out_thresh=0.2):
         outlier_rate,
         abs_outlier_rate,
     )
-
-
-def get_all_stats(
-    y_train,
-    y_pred,
-    imag_data,
-    save=True,
-    saveroot="",
-    redshift_bins=np.linspace(0, 2.5, 11),
-    imag_bins=np.linspace(18, 25.5, 11),
-):
-    Y = np.asarray(y_train)
-    Y2 = y_pred.flatten()
-    dz = (Y2 - Y) / (1 + Y)
-    stats = get_biweight_mean_sigma_outlier(dz, nclip=3, abs_out_thresh=0.2)
-
-    # split in terms of i-mags and redshifts
-    n_zbins = len(redshift_bins) - 1
-    redshift_stats = []
-    for i in range(n_zbins):
-        ind = (Y > redshift_bins[i]) & (Y < redshift_bins[i + 1])
-        redshift_stats.append(get_biweight_mean_sigma_outlier(dz[ind]))
-
-    n_imag_bins = len(imag_bins) - 1
-    imag_stats = []
-    for i in range(n_imag_bins):
-        ind = (imag_data > imag_bins[i]) & (imag_data < imag_bins[i + 1])
-        imag_stats.append(get_biweight_mean_sigma_outlier(dz[ind]))
-
-    if save is True:
-        with open(saveroot, "wb") as f:
-            pickle.dump([stats, redshift_stats, imag_stats], f)
-
-    return stats, redshift_stats, imag_stats
-
-
-def read_stats(fname):
-    with open(fname, "rb") as f:
-        data = pickle.load(f)
-    stats, redshift_stats, imag_stats = data
-    return stats, redshift_stats, imag_stats
-
-
-def stats_to_markdown(
-    stats1_input,
-    stats2_input,
-    labels=("Mean", "Mean err", "Std", "Outlier rate", "Abs outlier rate"),
-    skip_indices=(1,),
-    data_title=("Dataset 1", "Dataset 2"),
-):
-    # 0. Filter out skipped indices
-    keep = [i for i in range(len(stats1_input)) if i not in skip_indices]
-    stats1 = [stats1_input[i] for i in keep]
-    stats2 = [stats2_input[i] for i in keep]
-    labels = [labels[i] for i in keep]
-
-    # 1. Fractional change vs dataset 1
-    pct_change = [100 * (s2 - s1) / s1 if s1 != 0 else float("nan") for s1, s2 in zip(stats1, stats2)]
-
-    # 3. Build rows, rounded to 3 digits
-    rows = []
-    for label, s1, s2, pc in zip(labels, stats1, stats2, pct_change):
-        rows.append(f"| {label} | {s1:.3g} | {s2:.3g} | {pc:.3g}% |")
-
-    # 4. Assemble Markdown
-    md = f"| Statistic | {data_title[0]} | {data_title[1]} | % change |\n" "|---|---:|---:|---:|\n" + "\n".join(rows)
-    return md
