@@ -103,7 +103,6 @@ pz = znn.predict(model, test, **features)
 | `znn/models.py` | The model, training, prediction, saving and loading | `build_model`, `train_model`, `train_mean_model`, `train_scale_model`, `load_pretrained`, `predict`, `save_model_file`, `load_model_file` |
 | `znn/qp_output.py` | Packaging predictions as p(z) | `package_pdfs`, `predictions_mean_std` |
 | `znn/stats.py` | Robust point-estimate statistics | `get_biweight_mean_sigma_outlier`, `get_all_stats`, `stats_to_markdown` |
-| `znn/plotting.py` | Diagnostic plots | `plot_stats`, `compare_binned_stats`, `plot_losses`, `visualize_the_data` |
 
 Everything is importable from the top level, e.g. `znn.catalog_to_XY`.
 
