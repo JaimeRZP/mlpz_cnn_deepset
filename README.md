@@ -1,5 +1,6 @@
 <img width="482" height="209" alt="Screenshot From 2026-11-06 10-07-49" src="https://github.com/user-attachments/assets/b54d7f5a-5fd5-4f76-b35f-e08769af48c0" />
 
+[![Tests](https://github.com/JaimeRZP/znn/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/JaimeRZP/znn/actions/workflows/tests.yml)
 ![Lines of code](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FJaimeRZP%2Fznn%2Fbadges%2Floc.json)
 
 

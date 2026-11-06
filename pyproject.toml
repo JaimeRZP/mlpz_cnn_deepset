@@ -20,6 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 qp = ["qp-prob>=1.0.1"]
+test = ["pytest", "qp-prob>=1.0.1", "pyarrow"]
 
 [tool.setuptools]
 packages = ["znn"]
@@ -38,3 +39,6 @@ ignore = ["E741"]
 
 [tool.ruff.lint.per-file-ignores]
 "znn/__init__.py" = ["F401", "F403", "E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
