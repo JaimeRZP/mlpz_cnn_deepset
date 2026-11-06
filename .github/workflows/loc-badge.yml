@@ -1,0 +1,31 @@
+name: LOC badge
+
+on:
+  push:
+    branches: [main]
+    paths: ["znn/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  loc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Count lines in znn/
+        run: |
+          LOC=$(find znn -name '*.py' -print0 | xargs -0 cat | wc -l)
+          echo "znn/ has $LOC lines"
+          mkdir -p badge
+          printf '{"schemaVersion":1,"label":"lines of code","message":"%s","color":"blue"}\n' "$LOC" > badge/loc.json
+
+      - name: Publish to badges branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: badges
+          publish_dir: badge
+          force_orphan: true
